@@ -98,8 +98,8 @@ jobs:
 | www.hxym18.com | home | ✓ | ✓ | `no-cache` | `immutable` | 绿（enforce） |
 | schulte.hxym18.com | schulte-v2 | ✓ | ✓ | `no-store` | `immutable` | 绿（enforce） |
 | ka.hxym18.com | card | ✓（10-19 修） | ✓（10-19 修） | `no-cache` | `immutable` | 绿 |
-| nt.hxym18.com | nuantie | ✓ | ✓ | **无** | **无** | 红 ×4（warn） |
-| gldcd.hxym18.com | zbh | ✓ | ✓ | `no-store` | 短缓存 | 红 ×1（og 图长缓存） |
+| nt.hxym18.com | nuantie | ✓ | ✓ | `no-cache` + 强 ETag | `max-age=3600`（图片） | 绿（enforce，10-19 修） |
+| gldcd.hxym18.com | zbh | ✓ | ✓ | `no-store` | 短缓存 | og 图已改 `no-cache`，待部署 |
 | wj.hxym18.com | zitie | ✓ | ✓ | 只有 s-maxage | `immutable` | 黄 |
 | yq.hxym18.com | wordinput | ✓ | ✓ | 只有 s-maxage | `immutable` | 黄 |
 | fang.hxym18.com | fang | ✓ | — | 只有 s-maxage | — | 黄 ×3 |
@@ -115,6 +115,23 @@ jobs:
 
 **接入前置条件**：新项目接入前先跑 `bash scripts/audit-assets.sh <域名>` 到「契约满足」，再在 conf 里设 `ASSET_CONTRACT=enforce`。
 存量项目先设 `warn`（只报告），修干净再改 `enforce` —— 否则一次部署会因为历史遗留的头直接回滚。
+
+## 为什么不走「构建镜像 → 推 registry → 服务器拉取」
+
+2026-10-19 实测否决，记下来免得再试一遍：
+
+- **跨境上行只有 ~8–20 KB/s**（GitHub runner → 这台服务器）。源码 tar 4.3 MB 要传约 9 分钟；镜像 2.3 GB 在物理上不可能。
+- 当天 registry 就是被这条路径拖死的：runner 对 `nuantie` 的 blob `PATCH` 传了 **20 多分钟**，客户端断开，`docker/distribution` 返 500 后退出（`ExitCode=2`）。它还是手工 `docker run` 建的、**没有重启策略**，死了就静默死着 —— `registry.hxym18.com` 和依赖它做增量拉取的 `home` 一起哑掉，没人发现。已补 `--restart unless-stopped`。
+- 结论：**大镜像项目一律在服务器构建**（`--build`），runner 只传源码，且源码先 `gzip -1`（4.3MB → 1.7MB，2.5×）。
+- registry 只对「镜像小、层复用率高」的场景有意义。别为了架构好看把 2GB 镜像往上推。
+
+## 阶段顺序是死的
+
+`收包校验 → 备份（compose + DB）→ **回滚点** → 同步源码 → 构建 → 自检 → 原子切换 → wait_ready → 三层验收 → 失败回滚`
+
+**回滚点必须在构建之前**。构建会把 `<project>:local` 重新指向新镜像，旧镜像随之变悬空；
+2026-10-19 的顺序是「先构建、再存回滚点」，取到的是当前容器引用的镜像 ID，而那个镜像已经不在库里
+（容器还在跑、镜像没了）→ `docker tag` 报 `No such image`，部署死在 rollback-point 阶段，而且**永远无法成功**。
 
 ## 接入步骤（照抄）
 
