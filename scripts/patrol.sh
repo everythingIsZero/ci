@@ -103,6 +103,22 @@ for f in "$CONF_DIR"/*.conf; do
   last_at="$(g LAST_AT)"
   prev_tag="$(g PREV_TAG)"
   tags="$(g IMAGE_TAGS)"
+  cur_img="$(g CURRENT_IMAGE)"
+
+  # 「从没成功部署过」和「线上落后」是两件事，不能混成一个红：
+  #   · 从没部署过 → 线上跑的还是旧栈容器，拿 HEAD 去比镜像标签必然对不上，
+  #     天天红、红项一多就没人看，巡检本身失去信号价值；
+  #   · 部署过、但这次的提交没上去 → 这才是真漂移，必须红。
+  # 判据用 CURRENT_IMAGE（部署成功才会写），不是 LAST_RESULT —— 后者失败也会写。
+  # 注意 dry-run 也会落 state（只记 LAST_DRY_RUN_AT），所以「有 state」≠「部署过」。
+  if [[ -z "$cur_img" ]]; then
+    if [[ -z "$last_res" ]]; then
+      ylw "尚未部署过（只有 dry-run 记录）—— 线上仍是旧栈容器"
+    else
+      ylw "部署从未成功（LAST_RESULT=${last_res}，${last_at:-无时间}）—— 线上仍是旧栈容器"
+    fi
+    continue
+  fi
 
   # ① 线上是否真的是 HEAD 这一版
   head_sha="$(gh api "repos/$OWNER/$repo/commits/HEAD" --jq .sha 2>/dev/null | cut -c1-7)"
