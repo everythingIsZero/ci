@@ -253,7 +253,14 @@ cmd_deploy() {
   step "部署 ${PROJECT} → ${target}"
   echo "  形态 ${MODE} · 域名 ${DOMAIN} · 日志 ${logf}"
 
-  $DOCKER image inspect "$target" >/dev/null 2>&1 || die "镜像 ${target} 不在本机，先传输" 2
+  $DOCKER image inspect "$target" >/dev/null 2>&1 || {
+    if [[ "$target" == *"/"* ]]; then
+      step "拉取镜像 $target（增量）"
+      $DOCKER pull "$target" || die "镜像 ${target} 拉取失败" 2
+    else
+      die "镜像 ${target} 不在本机，先传输" 2
+    fi
+  }
   ok "镜像已就位：$($DOCKER image inspect -f '{{.Id}}' "$target" | cut -c1-19)"
 
   backup_current "$p" "$dry_run"

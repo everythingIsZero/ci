@@ -27,11 +27,17 @@ on:
       build_args:
         default: ""
         type: string
-      upload_image:
+      push_image:
         default: true
         type: boolean
     secrets:
       NPM_TOKEN:
+        required: false
+      REGISTRY_HOST:
+        required: false
+      REGISTRY_USER:
+        required: false
+      REGISTRY_PASS:
         required: false
     outputs:
       image:
@@ -53,8 +59,9 @@ jobs:
       - name: 解析元信息
         id: meta
         run: |
-          echo "image=${{ inputs.project }}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
           echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image=${{ inputs.project }}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "remote=${{ secrets.REGISTRY_HOST }}/${{ inputs.project }}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
       - uses: pnpm/action-setup@v4
         if: inputs.package_manager == 'pnpm'
@@ -100,13 +107,14 @@ jobs:
           docker run --rm --entrypoint sh "$img" -c 'echo 镜像可执行' \
             || echo "::warning::镜像无 sh（distroless/scratch），跳过结构冒烟"
 
-      - name: 导出镜像
-        if: inputs.upload_image
-        run: docker save "${{ steps.meta.outputs.image }}" | gzip -1 > /tmp/image.tar.gz
+      - name: 登录私有 registry
+        if: inputs.push_image
+        run: |
+          echo "${{ secrets.REGISTRY_PASS }}" | docker login "${{ secrets.REGISTRY_HOST }}" \
+            -u "${{ secrets.REGISTRY_USER }}" --password-stdin
 
-      - uses: actions/upload-artifact@v4
-        if: inputs.upload_image
-        with:
-          name: image-${{ inputs.project }}
-          path: /tmp/image.tar.gz
-          retention-days: 7
+      - name: 推送镜像（只传缺失层）
+        if: inputs.push_image
+        run: |
+          docker tag "${{ steps.meta.outputs.image }}" "${{ steps.meta.outputs.remote }}"
+          docker push "${{ steps.meta.outputs.remote }}"
