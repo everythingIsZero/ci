@@ -123,11 +123,20 @@ recv_source() {
 }
 
 extract_source() {
-  local sd
+  local sd e top keep=()
   sd="$(cmd_where "$PROJECT")"
   step "同步源码 → $sd"
-  # 保留 node_modules：服务器侧依赖复用，否则每次全量重装
-  find "$sd" -mindepth 1 -maxdepth 1 ! -name node_modules -exec rm -rf {} + 2>/dev/null || true
+  # 清空 SOURCE_DIR 再解包（保证删除仓库里已移除的文件）。两处必须保留：
+  #   ① node_modules —— 服务器侧依赖复用，否则每次全量重装
+  #   ② EXCLUDE_PATHS 的顶层目录 —— 它们**不在 git 里**（打包端 git archive 天然不会带），
+  #      但服务器上确实存在且是数据：zitie 的 `data/` 是 2.3G 诗词库，
+  #      不排除就会在第一次部署时被这条 rm -rf 直接删掉。
+  #      EXCLUDE_PATHS 只在打包端生效，服务端这一侧原先完全没看它 —— 2026-10-19 发现。
+  for e in ${EXCLUDE_PATHS:-}; do
+    top="${e%%/*}"
+    [[ -n "$top" ]] && keep+=( ! -name "$top" )
+  done
+  find "$sd" -mindepth 1 -maxdepth 1 ! -name node_modules "${keep[@]}" -exec rm -rf {} + 2>/dev/null || true
   tar xf "$STAGED_TAR" -C "$sd" --no-same-owner
   rm -f "$STAGED_TAR"; STAGED_TAR=""
   ok "源码已同步（$(du -sh "$sd" | cut -f1)）"
@@ -310,7 +319,9 @@ selfcheck() {
     ip="$($DOCKER inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$name" 2>/dev/null)"
     if [[ -n "$ip" ]]; then
       code="$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://${ip}:${PORT}${HEALTH_PATH}" || echo 000)"
-      if [[ "$code" == "200" ]]; then passed=1; break; fi
+      # 2xx/3xx 都算活着：3xx 是应用自己在路由（fang 的 / 会 307 跳登录页）。
+      # 4xx/5xx 说明应用在但这条路径不对 —— 仍判红，判据不能松到「能连上就算好」。
+      if [[ "$code" =~ ^(2|3)[0-9][0-9]$ ]]; then passed=1; break; fi
     fi
     sleep 1
   done
@@ -323,7 +334,7 @@ selfcheck() {
     return 1
   fi
 
-  ok "旁路自检通过（${HEALTH_PATH} = 200）"
+  ok "旁路自检通过（${HEALTH_PATH} = ${code}）"
   $DOCKER rm -f "$name" >/dev/null 2>&1 || true
   rm -rf "$vol"
   return 0
@@ -350,8 +361,8 @@ wait_ready() {
       none)
         # 没有 HEALTHCHECK 的容器：running ≠ 应用就绪，必须实打实探活
         code="$(curl -s -o /dev/null -m 3 -w '%{http_code}' "https://${DOMAIN}${HEALTH_PATH}" 2>/dev/null || echo 000)"
-        if [[ "$code" == "200" ]]; then
-          ok "容器就绪（无 healthcheck，${HEALTH_PATH} 返回 200，等待 ${i}s）"
+        if [[ "$code" =~ ^(2|3)[0-9][0-9]$ ]]; then
+          ok "容器就绪（无 healthcheck，${HEALTH_PATH} 返回 ${code}，等待 ${i}s）"
           return 0
         fi
         ;;
