@@ -72,6 +72,19 @@ state_set() {
   done
 }
 
+# ---------- 失败兜底 ----------
+# 只有三条路径（selfcheck / wait_ready / verify）会写 LAST_RESULT，构建失败、
+# 切换失败、被信号杀掉都不写 → status 显示上一次的 success，人以为服务是好的。
+DEPLOY_DONE=0
+DEPLOY_STAGE="init"
+on_deploy_exit() {
+  local rc="${1:-0}"
+  [[ "$DEPLOY_DONE" == "1" || "$rc" == "0" ]] && return 0
+  [[ -n "${PROJECT:-}" ]] || return 0
+  state_set "$PROJECT" "LAST_RESULT=failed:${DEPLOY_STAGE}" "LAST_AT=$(date -Is)" 2>/dev/null || true
+  c_red "  ✗ 部署中断于阶段「${DEPLOY_STAGE}」（exit ${rc}）—— 已写入 state，勿只看上次 success"
+}
+
 # ---------- 源码同步：必须在锁内做 ----------
 # 放在 CI 里做的话，两个部署可以交叉写同一个 SOURCE_DIR（A 同步 → B 同步 → A 构建，
 # 构建的是 B 的源码）。移到锁内后「同步 + 构建 + 切换」是一个整体。
@@ -169,14 +182,56 @@ retag() {
 }
 
 # ---------- 备份：切换前先留退路 ----------
-backup_current() {
-  local p="$1" dry="${2:-0}" ts cur tag prefix
+# 分两步，因为「配置/数据备份」必须在源码同步之前，而「回滚 tag」要等构建完
+# 才能知道新镜像是不是同一个（同 commit 重部署时镜像 ID 不变，此时打 tag 等于
+# 把回滚点指向当前版本，回滚变成空转却报成功）。
+backup_config() {
+  local p="$1" dry="${2:-0}" ts bak
+  ts="$(date +%Y%m%d-%H%M%S)"
+  bak="$DEPLOY_ROOT/backups/$p/$ts"
+  if [[ "$dry" == "1" ]]; then
+    echo "  (dry-run) 将备份配置与数据到 $bak"
+    return 0
+  fi
+  mkdir -p "$bak" 2>/dev/null || true
+  if [[ -f "${COMPOSE_FILE:-}" ]]; then
+    cp "$COMPOSE_FILE" "$bak/compose.yml" 2>/dev/null && ok "compose 已备份"
+  elif [[ -f "${STACK_FILE:-}" ]]; then
+    cp "$STACK_FILE" "$bak/stack.yml" 2>/dev/null && warn "集中栈 compose 已备份（回滚不自动还原，避免波及同栈其他服务）"
+  fi
+  if [[ -n "${DB_PATH:-}" && -f "${DB_PATH:-}" ]]; then
+    # 不能只 cp 主文件：SQLite 在 WAL 模式下数据几乎都在 -wal 里，
+    # 主文件可能只有 4KB（2026-10-19 实测：主库 4096B / WAL 3.3MB）→ 备份出来是空库。
+    local dbout="$bak/$(basename "$DB_PATH")"
+    if command -v sqlite3 >/dev/null 2>&1; then
+      if sqlite3 "$DB_PATH" ".backup '$dbout'" 2>/dev/null && [[ -s "$dbout" ]]; then
+        ok "数据库已备份（sqlite3 .backup，含 WAL，$(du -h "$dbout" | cut -f1)）"
+      else
+        c_red "  数据库备份失败：$DB_PATH —— 回滚会丢数据"
+      fi
+    else
+      cp "$DB_PATH" "$dbout" 2>/dev/null || true
+      [[ -f "$DB_PATH-wal" ]] && cp "$DB_PATH-wal" "$dbout-wal" 2>/dev/null || true
+      [[ -f "$DB_PATH-shm" ]] && cp "$DB_PATH-shm" "$dbout-shm" 2>/dev/null || true
+      warn "无 sqlite3，已连同 -wal/-shm 一起拷贝（非原子快照）"
+    fi
+  fi
+  state_set "$p" "PREV_DIR=$bak"
+}
+
+# 只在「新镜像 ≠ 当前运行镜像」时打回滚点；否则保留上一个真正的回滚点
+make_rollback_point() {
+  local p="$1" new_img="$2" dry="${3:-0}" ts cur tag prefix
   ts="$(date +%Y%m%d-%H%M%S)"
   prefix="${IMAGE_LOCAL%%:*}"
   cur="$(current_image_id)"
   if [[ -z "$cur" ]]; then
     warn "当前容器不存在或未运行，跳过回滚点（首次部署）"
-    state_set "$p" "PREV_TAG="
+    state_set "$p" "PREV_TAG=" "PREV_IMAGE="
+    return 0
+  fi
+  if [[ -n "$new_img" && "$cur" == "$new_img" ]]; then
+    warn "新镜像与当前运行镜像相同（同一提交重部署）—— 保留上一个回滚点，不覆盖"
     return 0
   fi
   tag="${prefix}:rollback-${ts}"
@@ -185,22 +240,7 @@ backup_current() {
     return 0
   fi
   retag "$cur" "$tag"
-
-  # 镜像之外还要备份「配置与数据」：compose 文件在 SOURCE_DIR 内会被同步覆盖，
-  # 只还原镜像不还原 compose，等于用坏配置再启一次。
-  local bak="$DEPLOY_ROOT/backups/$p/$ts"
-  mkdir -p "$bak" 2>/dev/null || true
-  if [[ -f "${COMPOSE_FILE:-}" ]]; then
-    cp "$COMPOSE_FILE" "$bak/compose.yml" 2>/dev/null && ok "compose 已备份"
-  elif [[ -f "${STACK_FILE:-}" ]]; then
-    cp "$STACK_FILE" "$bak/stack.yml" 2>/dev/null && warn "集中栈 compose 已备份（回滚不自动还原，避免波及同栈其他服务）"
-  fi
-  if [[ -n "${DB_PATH:-}" && -f "${DB_PATH:-}" ]]; then
-    cp "$DB_PATH" "$bak/" 2>/dev/null && ok "数据库已备份（cp 快照，WAL 模式下不保证一致）" \
-      || warn "数据库备份失败：$DB_PATH"
-  fi
-
-  state_set "$p" "PREV_TAG=$tag" "PREV_IMAGE=$cur" "PREV_DIR=$bak"
+  state_set "$p" "PREV_TAG=$tag" "PREV_IMAGE=$cur"
   ok "回滚点已保存：$tag"
 }
 
@@ -465,12 +505,23 @@ cmd_deploy() {
   load_conf "$p"
   # 本次提交的 sha 同时作为指纹验收的期望值（conf 里可覆盖）
   EXPECT_SHA="${EXPECT_SHA:-$sha}"
-  local target="${IMAGE_OVERRIDE:-${PROJECT}:${sha:-latest}}"
+  # 演练不换镜像：没有 --build 也没有 --image 时，验的就是当前线上那个镜像，
+  # 而不是去找不存在的 <project>:latest（self-compose 的本地名是 IMAGE_LOCAL）
+  local target="${IMAGE_OVERRIDE:-}"
+  if [[ -z "$target" ]]; then
+    if [[ "$dry_run" == "1" && "$build" != "1" ]]; then target="$IMAGE_LOCAL"; else target="${PROJECT}:${sha:-latest}"; fi
+  fi
   local logf="$LOG_DIR/${p}-$(date +%Y%m%d-%H%M%S).log"
   exec > >(tee -a "$logf") 2>&1
 
+  # 失败兜底：任何一条没写 LAST_RESULT 的退出路径（构建失败 / 切换失败 / 被信号杀掉），
+  # 都要留下痕迹 —— 否则 status 会显示上一次的 success，人以为服务是好的。
+  DEPLOY_STAGE="init"
+  trap 'on_deploy_exit $?' EXIT
+
   step "部署 ${PROJECT} → ${target}"
   echo "  形态 ${MODE} · 域名 ${DOMAIN} · 日志 ${logf}"
+  echo "  部署器 $(cat "$DEPLOY_ROOT/bin/deploy.version" 2>/dev/null || echo 未标记)"
 
   # 先把源码收下来并验完：包是坏的就不该动备份（转了回滚点 = 丢掉上一个可回滚版本）
   [[ -n "$tar_src" ]] && recv_source "$tar_src"
@@ -490,12 +541,20 @@ cmd_deploy() {
 
   # 备份必须早于源码同步：compose.yml 就在 SOURCE_DIR 里，同步之后再备份到的是新配置，
   # 回滚还原它等于用新配置再启一次。
-  backup_current "$p" "$dry_run"
+  DEPLOY_STAGE="backup"
+  backup_config "$p" "$dry_run"
 
   # 同步紧跟备份、且都在锁内：不会出现「A 同步完、B 又同步、A 构建的是 B 的源码」
-  [[ -n "$STAGED_TAR" ]] && extract_source
+  # dry-run 不动线上源码（否则演练会把生产源码换成未验证的提交）
+  if [[ -n "$STAGED_TAR" && "$dry_run" != "1" ]]; then
+    DEPLOY_STAGE="sync"
+    extract_source
+  elif [[ -n "$STAGED_TAR" ]]; then
+    warn "dry-run：跳过源码同步（线上源码未改动）"
+  fi
 
   if [[ "$build" == "1" ]]; then
+    DEPLOY_STAGE="build"
     check_build_env
     step "服务器构建 $SERVICE（构建期间线上容器不受影响）"
     if [[ "$dry_run" == "1" ]]; then
@@ -507,7 +566,12 @@ cmd_deploy() {
     target="$IMAGE_LOCAL"
   fi
 
+  # 回滚点：构建完才知道新镜像 ID；同镜像重部署时不能覆盖上一个真正的回滚点
+  DEPLOY_STAGE="rollback-point"
+  make_rollback_point "$p" "$($DOCKER image inspect -f '{{.Id}}' "$target" 2>/dev/null || true)" "$dry_run"
+
   if [[ "$skip_selfcheck" == "0" ]]; then
+    DEPLOY_STAGE="selfcheck"
     if ! selfcheck "$p" "$target"; then
       c_red "\n部署中止：新镜像未通过旁路自检，线上未做任何改动"
       state_set "$p" "LAST_RESULT=selfcheck-failed" "LAST_AT=$(date -Is)"
@@ -525,7 +589,8 @@ cmd_deploy() {
       central-stack) echo "    docker compose -f $STACK_FILE up -d --no-build --force-recreate $SERVICE" ;;
     esac
     echo "    回滚点保留在 $(state_get "$p" PREV_TAG)"
-    state_set "$p" "LAST_RESULT=dry-run" "LAST_AT=$(date -Is)"
+    # 演练没有部署任何东西，不该覆盖「上次部署结果」——只记演练时间
+    state_set "$p" "LAST_DRY_RUN_AT=$(date -Is)"
     return 0
   fi
   retag "$target" "$IMAGE_LOCAL"
@@ -535,6 +600,7 @@ cmd_deploy() {
     retag "$IMAGE_LOCAL" "${IMAGE_LOCAL%%:*}:sha-${sha:0:7}"
     ok "提交标签 ${IMAGE_LOCAL%%:*}:sha-${sha:0:7}"
   fi
+  DEPLOY_STAGE="switch"
   if ! compose_up; then
     c_red "切换失败，立即回滚"
     cmd_rollback "$p" --auto
@@ -542,6 +608,7 @@ cmd_deploy() {
   fi
   ok "容器已切换"
 
+  DEPLOY_STAGE="wait-ready"
   if ! wait_ready; then
     c_red "新容器未就绪，自动回滚"
     cmd_rollback "$p" --auto
@@ -549,9 +616,11 @@ cmd_deploy() {
     exit 1
   fi
 
+  DEPLOY_STAGE="verify"
   if verify "$p"; then
     state_set "$p" "CURRENT_TAG=$IMAGE_LOCAL" "CURRENT_IMAGE=$($DOCKER image inspect -f '{{.Id}}' "$IMAGE_LOCAL")" \
       "LAST_SHA=$sha" "LAST_RESULT=success" "LAST_AT=$(date -Is)"
+    DEPLOY_DONE=1
     ok "部署成功"
     cleanup_old "$p"
     return 0
@@ -575,8 +644,14 @@ cmd_rollback() {
 
   step "回滚 ${PROJECT} → ${prev}"
   local bak; bak="$(state_get "$p" PREV_DIR)"
-  if [[ "$MODE" == "self-compose" && -n "$bak" && -f "$bak/compose.yml" ]]; then
-    cp "$bak/compose.yml" "$COMPOSE_FILE" 2>/dev/null && ok "已还原部署前的 compose"
+  if [[ "$MODE" == "self-compose" ]]; then
+    if [[ -n "$bak" && -f "$bak/compose.yml" ]]; then
+      cp "$bak/compose.yml" "$COMPOSE_FILE" 2>/dev/null && ok "已还原部署前的 compose"
+    else
+      # 只还原镜像 = 用新配置再启一次，等于没回滚。必须喊出来，不能静默跳过。
+      c_red "  ✗ 没有可用的 compose 备份（PREV_DIR=${bak:-空}）—— 只还原镜像，配置仍是新的"
+      c_red "    若这次失败源于 compose 改动，回滚不会生效；需人工比对 $COMPOSE_FILE"
+    fi
   fi
   retag "$prev" "$IMAGE_LOCAL"
   compose_up || die "回滚切换失败，需人工介入" 1
@@ -641,6 +716,9 @@ cmd_where() {
 
 cmd_excludes() { load_conf "$1"; echo "${EXCLUDE_PATHS:-}"; }
 
+# 单独备份一次（部署前手动兜底 / 验证备份是否真的能恢复）
+cmd_backup() { load_conf "$1"; backup_config "$1" 0; }
+
 cmd_list() {
   step "已接入项目"
   for f in "$CONF_DIR"/*.conf; do
@@ -676,7 +754,24 @@ cmd_cleanup() {
     p="$(basename "$f" .conf)"
     load_conf "$p"
     cleanup_old "$p"
+    # 备份目录（含 SQLite 快照）同样只增不减，按 KEEP_ROLLBACK 保留最近几份
+    local bdir="$DEPLOY_ROOT/backups/$p" n
+    if [[ -d "$bdir" ]]; then
+      n=0
+      while IFS= read -r d; do
+        n=$((n + 1))
+        [[ "$n" -le "$KEEP_ROLLBACK" ]] && continue
+        rm -rf "$d" && echo "  清理旧备份 $(basename "$d")"
+      done < <(ls -1d "$bdir"/* 2>/dev/null | sort -r)
+    fi
   done
+  # 日志同样只增不减：留 30 天
+  local nlog
+  nlog="$(find "$LOG_DIR" -name '*.log' -type f -mtime +30 2>/dev/null | wc -l)"
+  if [[ "$nlog" -gt 0 ]]; then
+    find "$LOG_DIR" -name '*.log' -type f -mtime +30 -delete 2>/dev/null || true
+    echo "  清理 30 天前日志 ${nlog} 个"
+  fi
   echo
   df -h / | tail -1
 }
@@ -687,16 +782,19 @@ main() {
     deploy)
       [[ $# -ge 1 ]] || die "用法：deploy.sh deploy <project>" 2
       exec 9>"$DEPLOY_ROOT/.deploy.lock"
-      flock -w "${LOCK_WAIT:-10}" 9 || die "另一个部署正在进行（锁 $DEPLOY_ROOT/.deploy.lock），稍后重试" 2
+      # 全局锁（构建会抢内存，两个项目并行构建会互相拖垮）→ 排队而不是 10 秒就放弃。
+      # 一次部署含构建 + 25s 自检 + 45s 等待，默认等 20 分钟。
+      flock -w "${LOCK_WAIT:-1200}" 9 || die "另一个部署仍在进行（已等 ${LOCK_WAIT:-1200}s，锁 $DEPLOY_ROOT/.deploy.lock）" 2
       cmd_deploy "$@"
       ;;
     rollback)
       [[ $# -ge 1 ]] || die "用法：deploy.sh rollback <project>" 2
       exec 9>"$DEPLOY_ROOT/.deploy.lock"
-      flock -w "${LOCK_WAIT:-10}" 9 || die "另一个部署正在进行，稍后重试" 2
+      flock -w "${LOCK_WAIT:-1200}" 9 || die "另一个部署仍在进行（已等 ${LOCK_WAIT:-1200}s），稍后重试" 2
       cmd_rollback "$@"
       ;;
     cleanup)  cmd_cleanup ;;
+    backup)   [[ $# -ge 1 ]] || die "用法：deploy.sh backup <project>" 2; cmd_backup "$@" ;;
     status)   [[ $# -ge 1 ]] || die "用法：deploy.sh status <project>" 2; cmd_status "$@" ;;
     verify)   [[ $# -ge 1 ]] || die "用法：deploy.sh verify <project>" 2; cmd_verify "$@" ;;
     selfcheck) [[ $# -ge 1 ]] || die "用法：deploy.sh selfcheck <project> [image]" 2; cmd_selfcheck "$@" ;;

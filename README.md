@@ -31,7 +31,7 @@
 .github/workflows/deploy.yml  可复用：打包源码 → 交给服务器部署器（stdin）
 scripts/deploy.sh             服务器侧唯一入口
 scripts/install.sh            把部署器与配置装到 /opt/deploy，并装每日清理任务
-projects/<项目>.conf          每个项目的部署参数（不进公开仓）
+projects/<项目>.conf          每个项目的部署参数（**含内网路径与容器名，不含密钥**）
 ```
 
 ## 部署器做的事
@@ -117,6 +117,14 @@ deploy.sh cleanup                       # 清悬空镜像 + 7 天前的构建缓
 bash scripts/audit-assets.sh <域名>                    # 压缩 / 缓存 / 指纹 / 路由回退
 bash scripts/audit-assets.sh <域名> --container ip:port # 在服务器上跑，额外做压缩归属比对
 ```
+
+## 新人必读：服务器上没有的东西
+
+- **没有 git**。代码只能由 CI 用 tar 推上去；在服务器上手改的源码，下次部署就被覆盖。
+- **改了 `deploy.sh` 不跑 `install.sh` 就不生效**。部署时会打印「部署器 <git sha> @ <时间>」，对不上就是没装（2026-10-19 已发生过一次）。
+- **部署是全局串行的**。同一时刻只有一个部署在跑（构建抢内存），第二个会排队，默认最多等 20 分钟——看起来像"卡住"，其实在等锁。
+- **`--dry-run` 会跑旁路自检**（起一个临时容器），不碰线上容器、不改源码、不动回滚点，但仍占着锁。
+- **`central-stack` 的容器名是 `deploy-<service>-1`**，不是项目名；`IMAGE_LOCAL` 也不同（`deploy-<service>:latest`）。
 
 ## 边界（必须知道）
 

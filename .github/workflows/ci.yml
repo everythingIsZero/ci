@@ -53,6 +53,10 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    # 最小权限：这个 job 只读代码。默认 token 权限更宽，任何依赖的 postinstall
+    # 都能读到 .git/config 里的 token 并拿去推仓（供应链自传播）。
+    permissions:
+      contents: read
     concurrency:
       group: ci-${{ inputs.project }}-${{ github.ref }}
       cancel-in-progress: true
@@ -61,6 +65,8 @@ jobs:
       sha: ${{ steps.meta.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: 解析元信息
         id: meta

@@ -24,11 +24,15 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: production
+    permissions:
+      contents: read
     concurrency:
       group: deploy-${{ inputs.project }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: 配置 SSH
         run: |
