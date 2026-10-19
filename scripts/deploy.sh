@@ -6,10 +6,11 @@
 #   备份 → 旁路自检 → 原子切换 → 三层验收 → 失败自动回滚
 #
 # 用法：
-#   deploy.sh deploy   <project> [--sha <sha>] [--skip-selfcheck]
+#   deploy.sh deploy   <project> [--sha <sha>] [--image <ref>] [--build] [--tar -] [--skip-selfcheck] [--dry-run]
 #   deploy.sh rollback <project>
 #   deploy.sh status   <project>
 #   deploy.sh verify   <project>
+#   deploy.sh cleanup
 #   deploy.sh list
 #
 # 退出码：0 成功 · 1 部署/验收失败（已尝试回滚）· 2 前置条件不满足
@@ -69,6 +70,58 @@ state_set() {
     echo "$kv" >> "$f.tmp"
     mv "$f.tmp" "$f"
   done
+}
+
+# ---------- 源码同步：必须在锁内做 ----------
+# 放在 CI 里做的话，两个部署可以交叉写同一个 SOURCE_DIR（A 同步 → B 同步 → A 构建，
+# 构建的是 B 的源码）。移到锁内后「同步 + 构建 + 切换」是一个整体。
+#
+# 分两步：先 recv（收包 + 校验），再 extract（清空 + 解包）。
+# 中间夹着 backup_current —— 半截的流不该把回滚点转掉（转了就等于丢掉上一个可回滚版本）。
+STAGED_TAR=""
+
+recv_source() {
+  local src="$1"
+  [[ "$src" == "-" ]] || die "--tar 只支持 -（从 stdin 读 tar）" 2
+  [[ -t 0 ]] && die "--tar - 需要管道输入，当前 stdin 是终端" 2
+  STAGED_TAR="$TMP_DIR/${PROJECT}-src-$$.tar"
+  cat > "$STAGED_TAR"
+  if [[ ! -s "$STAGED_TAR" ]]; then
+    rm -f "$STAGED_TAR"; STAGED_TAR=""
+    die "收到的源码包为空，已中止（线上源码与回滚点均未动）" 2
+  fi
+  if ! tar tf "$STAGED_TAR" >/dev/null 2>&1; then
+    rm -f "$STAGED_TAR"; STAGED_TAR=""
+    die "源码包损坏，已中止（线上源码与回滚点均未动）" 2
+  fi
+  echo "  源码包 $(du -h "$STAGED_TAR" | cut -f1) 已收到并校验"
+}
+
+extract_source() {
+  local sd
+  sd="$(cmd_where "$PROJECT")"
+  step "同步源码 → $sd"
+  # 保留 node_modules：服务器侧依赖复用，否则每次全量重装
+  find "$sd" -mindepth 1 -maxdepth 1 ! -name node_modules -exec rm -rf {} + 2>/dev/null || true
+  tar xf "$STAGED_TAR" -C "$sd" --no-same-owner
+  rm -f "$STAGED_TAR"; STAGED_TAR=""
+  ok "源码已同步（$(du -sh "$sd" | cut -f1)）"
+}
+
+# ---------- 构建期变量：缺了就构建不出对的镜像 ----------
+# compose.yml 里的 build.args 从「项目目录/.env」取值，这个文件是手工放的、不在仓库里。
+# 缺了不会报错，只会静默构建出缺配置的镜像（如统计 id 为空）。
+check_build_env() {
+  [[ -n "${BUILD_ENV_REQUIRED:-}" ]] || return 0
+  local f="${BUILD_ENV_FILE:-${COMPOSE_PROJECT_DIR:-}/.env}"
+  [[ -f "$f" ]] || die "构建需要 ${BUILD_ENV_REQUIRED}，但找不到 $f" 2
+  local k v
+  for k in $BUILD_ENV_REQUIRED; do
+    v="$(grep -E "^${k}=" "$f" | tail -1 | cut -d= -f2-)"
+    v="${v%$'\r'}"; v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    [[ -n "$v" ]] || die "构建变量 ${k} 在 $f 里为空 —— 会静默构建出缺该配置的镜像" 2
+  done
+  ok "构建期变量齐备：${BUILD_ENV_REQUIRED}"
 }
 
 # ---------- 形态适配：把「切换」抽象成两条路径 ----------
@@ -258,6 +311,20 @@ verify() {
     warn "拿不到容器 IP，跳过直连检查"
   fi
 
+  # 运行中的容器必须就是 IMAGE_LOCAL 指向的那个镜像 —— 否则「验收通过」验的是别的东西
+  local run_img tag_img
+  run_img="$($DOCKER inspect -f '{{.Image}}' "$CONTAINER" 2>/dev/null || true)"
+  tag_img="$($DOCKER image inspect -f '{{.Id}}' "$IMAGE_LOCAL" 2>/dev/null || true)"
+  if [[ -n "$run_img" && -n "$tag_img" ]]; then
+    if [[ "$run_img" == "$tag_img" ]]; then
+      ok "运行镜像 = ${IMAGE_LOCAL}（${run_img:7:12}）"
+    else
+      c_red "运行镜像 ≠ ${IMAGE_LOCAL}（容器 ${run_img:7:12} / 标签 ${tag_img:7:12}）—— 容器没切过来"; fail=1
+    fi
+  else
+    warn "镜像身份比对跳过（容器或标签缺失）"
+  fi
+
   for path in $(printf '%s\n' "/" "$HEALTH_PATH" $SMOKE_PATHS | awk '!seen[$0]++'); do
     [[ -z "$path" ]] && continue
     code="$(curl -s -o /dev/null -m 10 -w '%{http_code}' "${base}${path}" || echo 000)"
@@ -311,7 +378,7 @@ verify() {
 # ---------- 主流程 ----------
 cmd_deploy() {
   local p="$1"; shift
-  local sha="" skip_selfcheck=0 dry_run=0 build=0
+  local sha="" skip_selfcheck=0 dry_run=0 build=0 tar_src=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --sha) sha="$2"; shift 2 ;;
@@ -319,11 +386,14 @@ cmd_deploy() {
       --skip-selfcheck) skip_selfcheck=1; shift ;;
       --dry-run) dry_run=1; shift ;;
       --build) build=1; shift ;;
+      --tar) tar_src="${2:--}"; shift 2 ;;
       *) die "未知参数 $1" 2 ;;
     esac
   done
 
   load_conf "$p"
+  # 本次提交的 sha 同时作为指纹验收的期望值（conf 里可覆盖）
+  EXPECT_SHA="${EXPECT_SHA:-$sha}"
   local target="${IMAGE_OVERRIDE:-${PROJECT}:${sha:-latest}}"
   local logf="$LOG_DIR/${p}-$(date +%Y%m%d-%H%M%S).log"
   exec > >(tee -a "$logf") 2>&1
@@ -331,17 +401,11 @@ cmd_deploy() {
   step "部署 ${PROJECT} → ${target}"
   echo "  形态 ${MODE} · 域名 ${DOMAIN} · 日志 ${logf}"
 
-  if [[ "$build" == "1" ]]; then
-    backup_current "$p" "$dry_run"
-    step "服务器构建 $SERVICE（构建期间线上容器不受影响）"
-    if [[ "$dry_run" == "1" ]]; then
-      warn "dry-run：将执行 compose build（不切换）"
-    else
-      compose_build || { c_red "构建失败，线上未做任何改动"; exit 1; }
-      ok "构建完成"
-    fi
-    target="$IMAGE_LOCAL"
-  else
+  # 先把源码收下来并验完：包是坏的就不该动备份（转了回滚点 = 丢掉上一个可回滚版本）
+  [[ -n "$tar_src" ]] && recv_source "$tar_src"
+
+  # 非构建模式：先确认镜像在位（拉不到就不必动源码与备份）
+  if [[ "$build" != "1" ]]; then
     $DOCKER image inspect "$target" >/dev/null 2>&1 || {
       if [[ "$target" == *"/"* ]]; then
         step "拉取镜像 $target（增量）"
@@ -351,7 +415,25 @@ cmd_deploy() {
       fi
     }
     ok "镜像已就位：$($DOCKER image inspect -f '{{.Id}}' "$target" | cut -c1-19)"
-    backup_current "$p" "$dry_run"
+  fi
+
+  # 备份必须早于源码同步：compose.yml 就在 SOURCE_DIR 里，同步之后再备份到的是新配置，
+  # 回滚还原它等于用新配置再启一次。
+  backup_current "$p" "$dry_run"
+
+  # 同步紧跟备份、且都在锁内：不会出现「A 同步完、B 又同步、A 构建的是 B 的源码」
+  [[ -n "$STAGED_TAR" ]] && extract_source
+
+  if [[ "$build" == "1" ]]; then
+    check_build_env
+    step "服务器构建 $SERVICE（构建期间线上容器不受影响）"
+    if [[ "$dry_run" == "1" ]]; then
+      warn "dry-run：将执行 compose build（不切换）"
+    else
+      compose_build || { c_red "构建失败，线上未做任何改动"; exit 1; }
+      ok "构建完成"
+    fi
+    target="$IMAGE_LOCAL"
   fi
 
   if [[ "$skip_selfcheck" == "0" ]]; then
@@ -377,6 +459,11 @@ cmd_deploy() {
   fi
   retag "$target" "$IMAGE_LOCAL"
   ok "已标记 ${target} → ${IMAGE_LOCAL}"
+  # 把提交号钉在镜像上：state 里记的 sha 是自述，镜像标签才是可核对的证据
+  if [[ -n "$sha" ]]; then
+    retag "$IMAGE_LOCAL" "${IMAGE_LOCAL%%:*}:sha-${sha:0:7}"
+    ok "提交标签 ${IMAGE_LOCAL%%:*}:sha-${sha:0:7}"
+  fi
   if ! compose_up; then
     c_red "切换失败，立即回滚"
     cmd_rollback "$p" --auto
@@ -437,11 +524,21 @@ cmd_rollback() {
 cmd_status() {
   local p="$1"
   load_conf "$p"
+  # 线上到底跑的哪个提交：从运行容器的镜像标签里读，而不是信 state 的自述
+  local run_img tags_on sha_tag
+  run_img="$($DOCKER inspect -f '{{.Image}}' "$CONTAINER" 2>/dev/null || true)"
+  tags_on="$($DOCKER image inspect -f '{{join .RepoTags " "}}' "$run_img" 2>/dev/null || true)"
+  sha_tag="$(grep -oE 'sha-[0-9a-f]{7,40}' <<<"$tags_on" | head -1 | sed 's/^sha-//' || true)"
+
   step "状态 ${PROJECT}"
   echo "  形态      $MODE"
   echo "  域名      https://${DOMAIN}${HEALTH_PATH}"
   echo "  当前镜像  $($DOCKER image inspect -f '{{.Id}}' "$IMAGE_LOCAL" 2>/dev/null | cut -c1-19 || echo 未知)"
+  echo "  线上提交  ${sha_tag:-未知（镜像无 sha 标签）}"
   echo "  上次提交  $(state_get "$p" LAST_SHA)"
+  if [[ -n "$sha_tag" && -n "$(state_get "$p" LAST_SHA)" && "$sha_tag" != "$(state_get "$p" LAST_SHA | cut -c1-7)" ]]; then
+    c_ylw "  ! 镜像标签与 state 记录不一致 —— 有人手工换过容器，或 state 被改过"
+  fi
   echo "  上次结果  $(state_get "$p" LAST_RESULT)  @ $(state_get "$p" LAST_AT)"
   echo "  回滚点    $(state_get "$p" PREV_TAG)"
   echo "  容器      $($DOCKER ps --filter "name=^${CONTAINER}$" --format '{{.Status}}' || echo 未运行)"
@@ -496,6 +593,12 @@ cleanup_old() {
 cmd_cleanup() {
   step "清理悬空镜像"
   $DOCKER image prune -f 2>&1 | tail -2
+  # 构建缓存只增不减：不清的话 /var/lib/docker 会一直涨
+  if $DOCKER builder prune -f --filter until=168h >/dev/null 2>&1; then
+    ok "构建缓存已清理（保留 7 天内，避免下次全量重建）"
+  else
+    warn "构建缓存清理跳过（当前 builder 不支持 --filter until）"
+  fi
   local f p
   for f in "$CONF_DIR"/*.conf; do
     [[ -e "$f" ]] || continue

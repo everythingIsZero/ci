@@ -20,5 +20,16 @@ ssh "$HOST" 'sudo -n mkdir -p /opt/deploy/bin /opt/deploy/projects /opt/deploy/s
   && sudo -n chown -R ubuntu:ubuntu /opt/deploy/state /opt/deploy/logs /opt/deploy/tmp /opt/deploy/backups \
   && echo 已安装 $(ls /opt/deploy/projects/*.conf | wc -l) 个项目配置'
 
+# 磁盘只增不减：回滚点只在成功路径清理，构建缓存从不清理 → 每天兜一次底
+echo "==> 定时清理"
+ssh "$HOST" 'sudo -n bash -s' <<'REMOTE'
+set -e
+crontab -l 2>/dev/null | grep -vF '/opt/deploy/bin/deploy.sh cleanup' > /tmp/cron.new || true
+echo '0 4 * * * /opt/deploy/bin/deploy.sh cleanup >> /opt/deploy/logs/cleanup.log 2>&1' >> /tmp/cron.new
+crontab /tmp/cron.new
+rm -f /tmp/cron.new
+echo "  已配置每日 04:00 清理"
+REMOTE
+
 echo "==> 自检"
 ssh "$HOST" 'sudo -n /opt/deploy/bin/deploy.sh list'
