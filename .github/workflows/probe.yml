@@ -10,13 +10,26 @@ jobs:
       - name: 端口连通性
         run: |
           HOST=122.51.150.41
-          for p in 22 80 443 2222 8443; do
+          for p in 22 80 443; do
             if timeout 6 bash -c "cat < /dev/null > /dev/tcp/$HOST/$p" 2>/dev/null; then
-              echo "端口 $p: 可达"
+              echo "端口 $p: TCP 握手成功"
             else
               echo "端口 $p: 不可达"
             fi
           done
+
+      - name: SSH banner（判断是否协议层被干扰）
+        run: |
+          HOST=122.51.150.41
+          echo "出口 IP: $(curl -s -m 10 https://api.ipify.org || echo 未知)"
+          out=$(timeout 12 bash -c "exec 3<>/dev/tcp/$HOST/22; head -c 40 <&3" 2>&1 || true)
+          echo "banner 原始输出: [$out]"
+          if echo "$out" | grep -q "SSH-2.0"; then
+            echo "结论: SSH 协议层可达"
+          else
+            echo "结论: 握手成功但拿不到 banner —— 协议层被阻断或 IP 被封"
+          fi
+
       - name: HTTPS 可达性
         run: |
           for u in https://www.hxym18.com/ https://nt.hxym18.com/healthz; do
