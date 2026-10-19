@@ -15,6 +15,12 @@ on:
       package_manager:
         default: pnpm
         type: string
+      # 留空 = 用 package.json 里的 packageManager 字段。
+      # 两个都指定会被 pnpm/action-setup 判成「Multiple versions of pnpm specified」直接失败
+      # （2026-10-19 zbh 接入时踩到：仓里写了 pnpm@11.24.0，这里又给 11）。
+      pnpm_version:
+        default: "11"
+        type: string
       node_version:
         default: "22"
         type: string
@@ -78,7 +84,7 @@ jobs:
       - uses: pnpm/action-setup@v4
         if: inputs.package_manager == 'pnpm'
         with:
-          version: 11
+          version: ${{ inputs.pnpm_version }}
 
       - uses: actions/setup-node@v4
         with:
