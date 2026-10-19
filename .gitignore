@@ -1,0 +1,4 @@
+# 项目配置不进公开仓（含域名、服务器路径）
+projects/
+node_modules/
+*.log
