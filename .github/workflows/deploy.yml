@@ -81,7 +81,10 @@ jobs:
           EOF
 
       - name: 连通性预检
-        run: ssh target 'echo SSH_OK && sudo -n docker version --format "{{.Server.Version}}"'
+        # 走部署器自己的探针，而不是 `echo && sudo docker version`：
+        # 这把密钥在服务器上被 forced command 限制成「只能调部署器」（scripts/ssh-gate.sh），
+        # 任意 shell 已经不给了 —— 这正是我们要的，所以 preflight 也得按新规矩来。
+        run: ssh target 'sudo -n /opt/deploy/bin/deploy.sh ping'
 
       - name: 同步源码 + 构建 + 部署（同步在锁内 → 自检 → 切换 → 验收 → 失败回滚）
         run: |

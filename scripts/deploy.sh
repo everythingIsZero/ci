@@ -345,7 +345,7 @@ asset_h() { asset_headers "$1" | grep -iE "^$2:" | tail -1 | cut -d: -f2- | sed 
 # 存量项目先 warn，修干净后再改 enforce —— 否则一次部署会因为历史遗留的头直接回滚。
 verify_assets() {
   local base="$1" ip="$2" mode="${ASSET_CONTRACT:-warn}" bad=0
-  local cc ce a url ext name m len hashed picked cce
+  local cc ce a url ext name m len hashed picked cce ct
 
   step "验收 L2：产物契约（压缩 / 缓存）"
   if [[ "$mode" == "enforce" ]]; then echo "  模式 enforce（不满足即失败）"; else echo "  模式 warn（只报告，不阻断本次部署）"; fi
@@ -372,10 +372,22 @@ verify_assets() {
   # 资源抽样：js / css / 图片 各取 1 个（不再只探一个）
   for ext in js css png svg; do
     picked=""
-    while IFS= read -r a; do [[ "$a" == *".$ext" ]] && { picked="$a"; break; }; done \
-      < <(curl -s -m 10 "$base/" | grep -oE "/[^\"' <>]+\.${ext}" | awk '!s[$0]++')
+    while IFS= read -r a; do
+      [[ "$a" == *".$ext" ]] || continue
+      # 跳过协议相对（//host/x.png）与绝对 URL：拼上 base 会变成
+      # https://site//site/x.png → 404 → 落到 SPA 兜底页（200 HTML + no-store），
+      # 那条路径会让检查"假绿"（2026-10-19 schulte-v2 的 og.png 就是这么假绿的）。
+      [[ "$a" == //* || "$a" == http* ]] && continue
+      picked="$a"; break
+    done < <(curl -s -m 10 "$base/" | grep -oE "/[^\"' <>]+\.${ext}" | awk '!s[$0]++')
     [[ -z "$picked" ]] && continue
     url="${base}${picked}"
+    ct="$(asset_h "$url" content-type)"
+    # 兜底页检测：要的是 js/css/图片，拿回 text/html 说明根本没命中该文件
+    if [[ "$ct" == text/html* ]]; then
+      c_red "  ${picked} 取回的是 HTML（SPA 兜底页）—— 资产本身没验到，先确认这个文件真的存在"; bad=1
+      continue
+    fi
     cc="$(asset_h "$url" cache-control)"
     ce="$(asset_h "$url" content-encoding)"
     len="$(curl -s -m 10 -o /dev/null -w '%{size_download}' "$url" 2>/dev/null || echo 0)"
@@ -776,6 +788,17 @@ cmd_cleanup() {
   df -h / | tail -1
 }
 
+# 连通性预检。
+# 为什么单独做成子命令：CI 的部署密钥现在是 forced command（只许调本部署器，
+# 见 scripts/ssh-gate.sh）。原来 preflight 直接跑 `echo SSH_OK && sudo docker version`，
+# 那要求密钥能执行任意 shell —— 等于把 root 交出去。改成走部署器自己的探针。
+cmd_ping() {
+  echo "SSH_OK"
+  echo "用户 $(id -un) · 部署器 $(cat "$DEPLOY_ROOT/bin/deploy.version" 2>/dev/null || echo 未标记)"
+  docker version --format 'docker {{.Server.Version}}' 2>/dev/null || echo "docker 不可用"
+  echo "项目配置 $(ls "$DEPLOY_ROOT/projects"/*.conf 2>/dev/null | wc -l | tr -d ' ') 个"
+}
+
 main() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
@@ -801,6 +824,7 @@ main() {
     where)    [[ $# -ge 1 ]] || die "用法：deploy.sh where <project>" 2; cmd_where "$@" ;;
     excludes) [[ $# -ge 1 ]] || die "用法：deploy.sh excludes <project>" 2; cmd_excludes "$@" ;;
     list)     cmd_list ;;
+    ping)     cmd_ping ;;
     *) sed -n '2,20p' "$0"; exit 2 ;;
   esac
 }

@@ -9,9 +9,11 @@ echo "==> 安装"
 # 不再经 /tmp 中转：/tmp 是世界可写目录（这台机器上还有第二个用户），
 # 从 /tmp 以 root 安装等于给本地提权留后门。内容直接从 stdin 交给 root 侧的 tee。
 ssh "$HOST" 'sudo -n tee /opt/deploy/bin/deploy.sh.new >/dev/null' < scripts/deploy.sh
+ssh "$HOST" 'sudo -n tee /opt/deploy/bin/ssh-gate.sh.new >/dev/null' < scripts/ssh-gate.sh
 ssh "$HOST" 'sudo -n mkdir -p /opt/deploy/bin /opt/deploy/projects /opt/deploy/state /opt/deploy/logs /opt/deploy/tmp /opt/deploy/backups \
   && sudo -n install -m 755 -o root -g root /opt/deploy/bin/deploy.sh.new /opt/deploy/bin/deploy.sh \
-  && sudo -n rm -f /opt/deploy/bin/deploy.sh.new'
+  && sudo -n install -m 755 -o root -g root /opt/deploy/bin/ssh-gate.sh.new /opt/deploy/bin/ssh-gate.sh \
+  && sudo -n rm -f /opt/deploy/bin/deploy.sh.new /opt/deploy/bin/ssh-gate.sh.new'
 
 # 配置同样走 stdin，逐个写入（不落 /tmp）
 for f in projects/*.conf; do
@@ -30,6 +32,43 @@ ssh "$HOST" 'sudo -n chown -R root:root /opt/deploy/bin /opt/deploy/projects \
 VER="$(git rev-parse --short HEAD 2>/dev/null || echo unknown) @ $(date '+%Y-%m-%d %H:%M')"
 printf '%s\n' "$VER" | ssh "$HOST" 'sudo -n tee /opt/deploy/bin/deploy.version >/dev/null && sudo -n chmod 644 /opt/deploy/bin/deploy.version'
 echo "  部署器版本 $VER"
+
+# 收紧 CI 部署密钥：加 forced command，只能调部署器。
+# 不做这一步的话，DEPLOY_SSH_KEY 等价 root（ubuntu 是 NOPASSWD: ALL），
+# 而它躺在 GitHub Secret 里 —— 任何能改 workflow 的人都能拿它执行任意命令。
+# 只改带 `github-actions-deploy` 注释的那一行；人工密钥原样不动（否则会把运维自己锁在门外）。
+echo "==> 收紧 CI 部署密钥"
+ssh "$HOST" 'sudo -n bash -s' <<'REMOTE'
+set -euo pipefail
+AK=/home/ubuntu/.ssh/authorized_keys
+GATE=/opt/deploy/bin/ssh-gate.sh
+[[ -f "$AK" ]] || { echo "  没有 $AK，跳过"; exit 0; }
+grep -q 'github-actions-deploy' "$AK" || { echo "  未找到 CI 部署密钥，跳过（人工登录不受影响）"; exit 0; }
+
+if grep -q "command=\"$GATE\"" "$AK"; then
+  echo "  已收紧过，跳过"
+else
+  cp -a "$AK" "$AK.bak.$(date +%Y%m%d-%H%M%S)"
+  python3 - "$AK" "$GATE" <<'PY'
+import sys
+ak, gate = sys.argv[1], sys.argv[2]
+opts = f'command="{gate}",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding'
+out, changed = [], 0
+for line in open(ak).read().splitlines():
+    if 'github-actions-deploy' in line and not line.startswith('command='):
+        line = f'{opts} {line}'
+        changed += 1
+    out.append(line)
+open(ak, 'w').write('\n'.join(out) + '\n')
+print(f'  已为 {changed} 条 CI 密钥加上 forced command（备份留在同目录 .bak.*）')
+PY
+fi
+
+# 权限必须复原，否则 sshd 直接拒绝这把密钥
+chown ubuntu:ubuntu "$AK"
+chmod 600 "$AK"
+echo "  当前 authorized_keys：$(wc -l < "$AK") 条，其中受限 $(grep -c "command=\"$GATE\"" "$AK" || true) 条"
+REMOTE
 
 # 磁盘只增不减：回滚点只在成功路径清理，构建缓存从不清理 → 每天兜一次底
 echo "==> 定时清理"
