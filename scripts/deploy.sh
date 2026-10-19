@@ -188,6 +188,23 @@ selfcheck() {
   return 0
 }
 
+wait_ready() {
+  local i st
+  for ((i = 0; i < 45; i++)); do
+    st="$($DOCKER inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$CONTAINER" 2>/dev/null || echo unknown)"
+    case "$st" in
+      healthy|running)
+        ok "容器就绪（${st}，等待 ${i}s）"
+        return 0
+        ;;
+    esac
+    sleep 1
+  done
+  c_red "容器 45 秒内未就绪（最后状态 ${st}）"
+  $DOCKER logs --tail 30 "$CONTAINER" 2>&1 | sed 's/^/    /' || true
+  return 1
+}
+
 # ---------- 验收：三层 ----------
 verify() {
   local p="$1" base="https://${DOMAIN}" code fail=0
@@ -319,6 +336,13 @@ cmd_deploy() {
   fi
   ok "容器已切换"
 
+  if ! wait_ready; then
+    c_red "新容器未就绪，自动回滚"
+    cmd_rollback "$p" --auto
+    state_set "$p" "LAST_RESULT=not-ready" "LAST_AT=$(date -Is)"
+    exit 1
+  fi
+
   if verify "$p"; then
     state_set "$p" "CURRENT_TAG=$IMAGE_LOCAL" "CURRENT_IMAGE=$($DOCKER image inspect -f '{{.Id}}' "$IMAGE_LOCAL")" \
       "LAST_SHA=$sha" "LAST_RESULT=success" "LAST_AT=$(date -Is)"
@@ -347,6 +371,7 @@ cmd_rollback() {
   retag "$prev" "$IMAGE_LOCAL"
   compose_up || die "回滚切换失败，需人工介入" 1
   ok "已回滚到 ${prev}"
+  wait_ready || warn "回滚后容器未在 45 秒内就绪"
 
   if verify "$p"; then
     state_set "$p" "LAST_RESULT=rolled-back" "LAST_AT=$(date -Is)"
