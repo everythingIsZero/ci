@@ -28,7 +28,7 @@ on:
         default: ""
         type: string
       push_image:
-        default: true
+        default: false
         type: boolean
     secrets:
       NPM_TOKEN:

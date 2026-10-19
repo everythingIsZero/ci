@@ -97,6 +97,18 @@ compose_up() {
   esac
 }
 
+compose_build() {
+  case "$MODE" in
+    self-compose)
+      $DOCKER compose -f "$COMPOSE_FILE" --project-directory "$COMPOSE_PROJECT_DIR" build "$SERVICE"
+      ;;
+    central-stack)
+      $DOCKER compose -f "$STACK_FILE" build "$SERVICE"
+      ;;
+    *) die "未知 MODE=$MODE" 2 ;;
+  esac
+}
+
 # 把镜像打成 compose 认识的名字（零侵入：不改任何 compose 文件）
 retag() {
   local src="$1" dst="$2"
@@ -234,13 +246,14 @@ verify() {
 # ---------- 主流程 ----------
 cmd_deploy() {
   local p="$1"; shift
-  local sha="" skip_selfcheck=0 dry_run=0
+  local sha="" skip_selfcheck=0 dry_run=0 build=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --sha) sha="$2"; shift 2 ;;
       --image) IMAGE_OVERRIDE="$2"; shift 2 ;;
       --skip-selfcheck) skip_selfcheck=1; shift ;;
       --dry-run) dry_run=1; shift ;;
+      --build) build=1; shift ;;
       *) die "未知参数 $1" 2 ;;
     esac
   done
@@ -253,17 +266,28 @@ cmd_deploy() {
   step "部署 ${PROJECT} → ${target}"
   echo "  形态 ${MODE} · 域名 ${DOMAIN} · 日志 ${logf}"
 
-  $DOCKER image inspect "$target" >/dev/null 2>&1 || {
-    if [[ "$target" == *"/"* ]]; then
-      step "拉取镜像 $target（增量）"
-      $DOCKER pull "$target" || die "镜像 ${target} 拉取失败" 2
+  if [[ "$build" == "1" ]]; then
+    backup_current "$p" "$dry_run"
+    step "服务器构建 $SERVICE（构建期间线上容器不受影响）"
+    if [[ "$dry_run" == "1" ]]; then
+      warn "dry-run：将执行 compose build（不切换）"
     else
-      die "镜像 ${target} 不在本机，先传输" 2
+      compose_build || { c_red "构建失败，线上未做任何改动"; exit 1; }
+      ok "构建完成"
     fi
-  }
-  ok "镜像已就位：$($DOCKER image inspect -f '{{.Id}}' "$target" | cut -c1-19)"
-
-  backup_current "$p" "$dry_run"
+    target="$IMAGE_LOCAL"
+  else
+    $DOCKER image inspect "$target" >/dev/null 2>&1 || {
+      if [[ "$target" == *"/"* ]]; then
+        step "拉取镜像 $target（增量）"
+        $DOCKER pull "$target" || die "镜像 ${target} 拉取失败" 2
+      else
+        die "镜像 ${target} 不在本机，先传输" 2
+      fi
+    }
+    ok "镜像已就位：$($DOCKER image inspect -f '{{.Id}}' "$target" | cut -c1-19)"
+    backup_current "$p" "$dry_run"
+  fi
 
   if [[ "$skip_selfcheck" == "0" ]]; then
     if ! selfcheck "$p" "$target"; then
@@ -355,6 +379,8 @@ cmd_selfcheck() {
   selfcheck "$p" "$img" && ok "自检通过"
 }
 
+cmd_where() { load_conf "$1"; echo "${SOURCE_DIR:-}"; }
+
 cmd_list() {
   step "已接入项目"
   for f in "$CONF_DIR"/*.conf; do
@@ -383,6 +409,7 @@ main() {
     status)   [[ $# -ge 1 ]] || die "用法：deploy.sh status <project>" 2; cmd_status "$@" ;;
     verify)   [[ $# -ge 1 ]] || die "用法：deploy.sh verify <project>" 2; cmd_verify "$@" ;;
     selfcheck) [[ $# -ge 1 ]] || die "用法：deploy.sh selfcheck <project> [image]" 2; cmd_selfcheck "$@" ;;
+    where)    [[ $# -ge 1 ]] || die "用法：deploy.sh where <project>" 2; cmd_where "$@" ;;
     list)     cmd_list ;;
     *) sed -n '2,20p' "$0"; exit 2 ;;
   esac

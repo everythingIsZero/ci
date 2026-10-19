@@ -19,8 +19,6 @@ on:
         required: true
       DEPLOY_SSH_USER:
         required: true
-      REGISTRY_HOST:
-        required: true
 
 jobs:
   deploy:
@@ -30,6 +28,8 @@ jobs:
       group: deploy-${{ inputs.project }}
       cancel-in-progress: false
     steps:
+      - uses: actions/checkout@v4
+
       - name: 配置 SSH
         run: |
           mkdir -p ~/.ssh
@@ -49,11 +49,21 @@ jobs:
       - name: 连通性预检
         run: ssh target 'echo SSH_OK && sudo -n docker version --format "{{.Server.Version}}"'
 
-      - name: 部署（拉取增量镜像 → 自检 → 切换 → 验收 → 失败回滚）
+      - name: 同步源码（只传 git 跟踪的文件，通常几 MB）
+        run: |
+          TARGET=$(ssh target "sudo -n /opt/deploy/bin/deploy.sh where ${{ inputs.project }}")
+          [ -n "$TARGET" ] || { echo "::error::conf 里没有 SOURCE_DIR"; exit 1; }
+          echo "同步到 $TARGET"
+          du -sh . --exclude=.git --exclude=node_modules 2>/dev/null || true
+          rsync -az --delete --stats \
+            --exclude '.git/' --exclude 'node_modules/' --exclude '.next/' \
+            --exclude 'dist/' --exclude '*.log' \
+            -e "ssh -F $HOME/.ssh/config" ./ "target:$TARGET/"
+
+      - name: 构建并部署（构建失败不影响线上 → 自检 → 切换 → 验收 → 失败回滚）
         run: |
           ssh target "sudo -n /opt/deploy/bin/deploy.sh deploy ${{ inputs.project }} \
-            --image ${{ secrets.REGISTRY_HOST }}/${{ inputs.project }}:${{ inputs.sha }} \
-            --sha ${{ inputs.sha }} ${{ inputs.skip_selfcheck && '--skip-selfcheck' || '' }}"
+            --build --sha ${{ inputs.sha }} ${{ inputs.skip_selfcheck && '--skip-selfcheck' || '' }}"
 
       - name: 部署后状态
         if: always()
