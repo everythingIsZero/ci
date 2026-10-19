@@ -10,7 +10,7 @@
 |---|---|---|---|---|---|
 | nuantie | self-compose | `/opt/nuantie/app` | `nuantie` | nt.hxym18.com | ✅ |
 | home | central-stack | `/opt/home/releases/20261005` | `home` | www.hxym18.com | ✅ |
-| schulte-v2 | self-compose | `/opt/schulte/app` | `schulte-v2` | schulte.hxym18.com | 🔄 |
+| schulte-v2 | self-compose | `/opt/schulte/app` | `schulte-v2` | schulte.hxym18.com | ✅ |
 | card | self-compose | `/opt/card/app` | `card` | ka.hxym18.com | ⬜ |
 | share-bridge | self-compose | `/opt/share-bridge/app` | `share-bridge` | share.hxym18.com | ⬜ |
 | zbh | central-stack | `/opt/trae-projects/apps/zbh` | `zbh` | gldcd.hxym18.com | ⬜ |
@@ -109,7 +109,13 @@ HEALTH_PATH=/healthz 或 /
 DOMAIN=...
 CHECK_COMPRESS=1               # 静态资源站点必开
 COMPRESS_PROBE=auto
+BUILD_ENV_REQUIRED="..."       # compose.yml 的 build.args 依赖的变量名（空格分隔）
+                               # 缺了不会报错，只会静默构建出缺配置的镜像 → 这里变硬失败
+DB_PATH=...                    # 有本地数据库时填，部署前会 cp 快照
+VERSION_PATH=/api/version      # 可选：项目能报版本时填，验收会比对提交号
 ```
+
+**`BUILD_ENV_REQUIRED` 怎么定**：打开项目 `compose.yml` 的 `build.args`，凡是写成 `"${XXX}"` 的（不是字面量），把 `XXX` 填进来。值从 `COMPOSE_PROJECT_DIR/.env` 读（`BUILD_ENV_FILE` 可覆盖）。确实不需要就删掉这一行。
 
 2. 项目仓加 `.github/workflows/deploy.yml`（照 nuantie 抄）
 3. 项目仓配 3 个 secrets：`DEPLOY_SSH_KEY` / `DEPLOY_SSH_HOST` / `DEPLOY_SSH_USER`
