@@ -1,143 +1,53 @@
-name: deploy
+# ⚠️ 已停用：本 workflow 不做任何部署，只负责「立刻报错并说明原因」。
+#
+# 2026-10-19：自研部署器（ssh → /opt/deploy/bin/deploy.sh）整体退役。
+# 保留这个文件，是为了有人点了 workflow_dispatch 时能马上看到为什么，
+# 而不是拿到一个「连不上服务器 / 超时」的误导性错误。
+#
+# 发布现在怎么做：工作区 knowledge/new-project.md（Swarm 平台原语）
+# 旧实现原文：Projects/.archive-ci-deployer-20261019/
+#
+# 什么时候可以删掉本文件：10 个项目仓的 `deploy` job 都移除之后。
+# 在那之前请勿往这里加任何部署逻辑 —— 加回来就等于重建刚拆掉的那套东西。
+
+name: deploy (retired)
 
 on:
   workflow_call:
     inputs:
       project:
-        required: true
+        required: false
         type: string
+        default: ""
       sha:
-        required: true
+        required: false
         type: string
+        default: ""
       skip_selfcheck:
-        default: false
+        required: false
         type: boolean
+        default: false
       allowed_branch:
-        description: 允许部署的分支（空 = 不限制）。防止 workflow_dispatch 选个未合并的 feature 分支直上生产
-        default: main
+        required: false
         type: string
+        default: ""
     secrets:
       DEPLOY_SSH_KEY:
-        required: true
+        required: false
       DEPLOY_SSH_HOST:
-        required: true
+        required: false
       DEPLOY_SSH_USER:
-        required: true
-      # 必须声明，否则 caller 传了也进不来（未声明的 secret 在 workflow_call 里不可见）
+        required: false
       DEPLOY_SSH_HOST_FP:
         required: false
 
 jobs:
-  deploy:
+  retired:
     runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      contents: read
-    concurrency:
-      group: deploy-${{ inputs.project }}
-      cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: 分支校验
-        if: inputs.allowed_branch != ''
+      - name: 说明
         run: |
-          ref="${GITHUB_REF#refs/heads/}"
-          if [ "$ref" != "${{ inputs.allowed_branch }}" ]; then
-            echo "::error::只允许从 ${{ inputs.allowed_branch }} 部署，当前分支 $ref"
-            exit 1
-          fi
-          echo "分支 $ref 允许部署"
-
-      - name: 配置 SSH
-        run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          # 主机密钥校验：ssh-keyscan 本身不带认证，直接信任等于把 tar 包交给可能的中间人。
-          # 若配了 DEPLOY_SSH_HOST_FP（ssh-keygen -lf 的第二列），就必须对上才继续。
-          ssh-keyscan -H "${{ secrets.DEPLOY_SSH_HOST }}" > /tmp/kh 2>/dev/null
-          FP="${{ secrets.DEPLOY_SSH_HOST_FP }}"
-          if [ -n "$FP" ]; then
-            got=$(ssh-keygen -lf /tmp/kh | awk '{print $2}' | sort -u | tr '\n' ' ')
-            case " $got " in
-              *" $FP "*) echo "主机密钥指纹匹配" ;;
-              *) echo "::error::主机密钥指纹不匹配（期望 $FP，实际 $got）"; exit 1 ;;
-            esac
-          else
-            echo "::warning::未配置 DEPLOY_SSH_HOST_FP，主机密钥未校验（建议补上）"
-          fi
-          cat /tmp/kh >> ~/.ssh/known_hosts
-          cat >> ~/.ssh/config <<EOF
-          Host target
-            HostName ${{ secrets.DEPLOY_SSH_HOST }}
-            User ${{ secrets.DEPLOY_SSH_USER }}
-            IdentityFile ~/.ssh/deploy_key
-            StrictHostKeyChecking yes
-            ConnectTimeout 20
-            ServerAliveInterval 15
-          EOF
-
-      - name: 连通性预检
-        # 走部署器自己的探针，而不是 `echo && sudo docker version`：
-        # 这把密钥在服务器上被 forced command 限制成「只能调部署器」（scripts/ssh-gate.sh），
-        # 任意 shell 已经不给了 —— 这正是我们要的，所以 preflight 也得按新规矩来。
-        run: ssh target 'sudo -n /opt/deploy/bin/deploy.sh ping'
-
-      - name: 同步源码 + 构建 + 部署（同步在锁内 → 自检 → 切换 → 验收 → 失败回滚）
-        run: |
-          # pipefail：`git archive | gzip` 里 git 失败会被 gzip 的成功掩盖，
-          # 结果就是发出一个 20 字节的空 gzip，服务器才报「源码包为空」——
-          # 错误现场离根因隔了两层，16:55 那次 home 部署就是这么白失败一次。
-          set -o pipefail
-          EX=$(ssh target "sudo -n /opt/deploy/bin/deploy.sh excludes ${{ inputs.project }}")
-          echo "排除：${EX:-无}"
-          pathspec=()
-          for p in $EX; do pathspec+=(":(exclude)$p"); done
-          # 先压缩再发：跨境上行实测 ~20 KB/s，是整条链路最慢的一环。
-          # gzip -1 对源码有 2.5× 左右收益（暖帖 4.3MB → 1.7MB），解压成本可忽略。
-          # 服务器侧按魔数识别，老 caller 发裸 tar 也照样能收。
-          git archive --format=tar HEAD -- . "${pathspec[@]}" | gzip -1 > /tmp/src.tar.gz
-          ls -lh /tmp/src.tar.gz
-          # 源码从 stdin 交给部署器：同步、构建、切换在同一把锁内完成。
-          # 拆成两条 ssh 的话，两个部署能交叉写同一个 SOURCE_DIR。
-          ssh target "sudo -n /opt/deploy/bin/deploy.sh deploy ${{ inputs.project }} \
-            --build --sha ${{ inputs.sha }} --tar - ${{ inputs.skip_selfcheck && '--skip-selfcheck' || '' }}" < /tmp/src.tar.gz
-
-      - name: 核对线上跑的就是这次提交（第三方证据，不信部署器自述）
-        run: |
-          want7="${{ inputs.sha }}"; want7="${want7:0:7}"
-          got="$(ssh target "sudo -n /opt/deploy/bin/deploy.sh deployed-sha ${{ inputs.project }}")"
-          echo "期望 sha-${want7} · 线上镜像标签：${got:-无}"
-          if [ -z "${got// /}" ]; then
-            echo "::error::线上容器没有 sha-* 标签，无法证明跑的是哪一版 —— 部署没真正生效"
-            exit 1
-          fi
-          if ! printf ' %s ' "$got" | grep -q " ${want7} "; then
-            echo "::error::线上跑的不是本次提交（期望 ${want7}，实际 ${got}）—— 部署没真正生效"
-            exit 1
-          fi
-          echo "✓ 线上确认运行 sha-${want7}"
-
-      - name: 结果汇总（写进 job summary，失败也留）
-        if: always()
-        run: |
-          {
-            echo "## 部署 ${{ inputs.project }}"
-            echo ""
-            echo "| 项 | 值 |"
-            echo "|---|---|"
-            echo "| 期望提交 | \`${{ inputs.sha }}\` |"
-            echo "| 触发 | ${{ github.event_name }} @ ${{ github.ref_name }} |"
-            echo "| 线上实际 | \`$(ssh target "sudo -n /opt/deploy/bin/deploy.sh deployed-sha ${{ inputs.project }}" 2>/dev/null || echo 取不到)\` |"
-            echo ""
-            echo "<details><summary>部署器状态</summary>"
-            echo ""
-            echo '```'
-            ssh target "sudo -n /opt/deploy/bin/deploy.sh status ${{ inputs.project }}" 2>&1 || true
-            echo '```'
-            echo ""
-            echo "</details>"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=部署器已退役::自研部署器于 2026-10-19 退役，本 workflow 不再部署任何东西。"
+          echo "发布流程：工作区 knowledge/new-project.md 与 knowledge/migrate-to-swarm.md"
+          echo "旧实现原文：Projects/.archive-ci-deployer-20261019/"
+          exit 1
