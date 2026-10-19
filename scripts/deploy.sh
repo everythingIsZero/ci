@@ -836,6 +836,24 @@ cmd_ping() {
   echo "项目配置 $(ls "$DEPLOY_ROOT/projects"/*.conf 2>/dev/null | wc -l | tr -d ' ') 个"
 }
 
+# 线上容器**实际**跑的提交 —— 客观证据（镜像上的 sha-<7> 标签），不是 state 自述。
+#
+# 为什么需要它：`LAST_RESULT=success` 和 `LAST_SHA` 都是部署器自己写的。
+# 2026-10-19 一天里出现过「部署器说成功、线上其实是旧版本」和「代码推了但根本没部署」
+# 两种静默失败，都因为没人拿第三方证据去核对。CI 在部署结束后用它做最后一道闸。
+cmd_deployed_sha() {
+  local p="$1" img tags
+  load_conf "$p"
+  img="$(current_image_id)"
+  if [[ -z "$img" ]]; then
+    echo "NO_CONTAINER"
+    return 1
+  fi
+  tags="$($DOCKER inspect -f '{{join .RepoTags " "}}' "$img" 2>/dev/null || true)"
+  printf '%s\n' "$tags" | tr ' ' '\n' | sed -n 's/^.*:sha-//p' | sort -u | tr '\n' ' '
+  echo
+}
+
 main() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
@@ -862,6 +880,7 @@ main() {
     excludes) [[ $# -ge 1 ]] || die "用法：deploy.sh excludes <project>" 2; cmd_excludes "$@" ;;
     list)     cmd_list ;;
     ping)     cmd_ping ;;
+    deployed-sha) [[ $# -ge 1 ]] || die "用法：deploy.sh deployed-sha <project>" 2; cmd_deployed_sha "$@" ;;
     *) sed -n '2,20p' "$0"; exit 2 ;;
   esac
 }

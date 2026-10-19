@@ -102,6 +102,38 @@ jobs:
           ssh target "sudo -n /opt/deploy/bin/deploy.sh deploy ${{ inputs.project }} \
             --build --sha ${{ inputs.sha }} --tar - ${{ inputs.skip_selfcheck && '--skip-selfcheck' || '' }}" < /tmp/src.tar.gz
 
-      - name: 部署后状态
+      - name: 核对线上跑的就是这次提交（第三方证据，不信部署器自述）
+        run: |
+          want7="${{ inputs.sha }}"; want7="${want7:0:7}"
+          got="$(ssh target "sudo -n /opt/deploy/bin/deploy.sh deployed-sha ${{ inputs.project }}")"
+          echo "期望 sha-${want7} · 线上镜像标签：${got:-无}"
+          if [ -z "${got// /}" ]; then
+            echo "::error::线上容器没有 sha-* 标签，无法证明跑的是哪一版 —— 部署没真正生效"
+            exit 1
+          fi
+          if ! printf ' %s ' "$got" | grep -q " ${want7} "; then
+            echo "::error::线上跑的不是本次提交（期望 ${want7}，实际 ${got}）—— 部署没真正生效"
+            exit 1
+          fi
+          echo "✓ 线上确认运行 sha-${want7}"
+
+      - name: 结果汇总（写进 job summary，失败也留）
         if: always()
-        run: ssh target "sudo -n /opt/deploy/bin/deploy.sh status ${{ inputs.project }}" || true
+        run: |
+          {
+            echo "## 部署 ${{ inputs.project }}"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 期望提交 | \`${{ inputs.sha }}\` |"
+            echo "| 触发 | ${{ github.event_name }} @ ${{ github.ref_name }} |"
+            echo "| 线上实际 | \`$(ssh target "sudo -n /opt/deploy/bin/deploy.sh deployed-sha ${{ inputs.project }}" 2>/dev/null || echo 取不到)\` |"
+            echo ""
+            echo "<details><summary>部署器状态</summary>"
+            echo ""
+            echo '```'
+            ssh target "sudo -n /opt/deploy/bin/deploy.sh status ${{ inputs.project }}" 2>&1 || true
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"

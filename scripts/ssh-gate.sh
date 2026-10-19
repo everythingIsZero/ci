@@ -18,7 +18,7 @@ set -uo pipefail
 
 DEPLOY_ROOT="${DEPLOY_ROOT:-/opt/deploy}"
 DEPLOY_BIN="$DEPLOY_ROOT/bin/deploy.sh"
-ALLOWED="deploy rollback status verify selfcheck excludes backup ping where list"
+ALLOWED="deploy rollback status verify selfcheck excludes backup ping where list deployed-sha"
 
 raw="${SSH_ORIGINAL_COMMAND:-}"
 
