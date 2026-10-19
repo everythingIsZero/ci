@@ -94,14 +94,26 @@ on_deploy_exit() {
 STAGED_TAR=""
 
 recv_source() {
-  local src="$1"
+  local src="$1" raw
   [[ "$src" == "-" ]] || die "--tar 只支持 -（从 stdin 读 tar）" 2
   [[ -t 0 ]] && die "--tar - 需要管道输入，当前 stdin 是终端" 2
+  raw="$TMP_DIR/${PROJECT}-src-$$.raw"
   STAGED_TAR="$TMP_DIR/${PROJECT}-src-$$.tar"
-  cat > "$STAGED_TAR"
-  if [[ ! -s "$STAGED_TAR" ]]; then
-    rm -f "$STAGED_TAR"; STAGED_TAR=""
+  cat > "$raw"
+  if [[ ! -s "$raw" ]]; then
+    rm -f "$raw"; STAGED_TAR=""
     die "收到的源码包为空，已中止（线上源码与回滚点均未动）" 2
+  fi
+  # 传输格式自适应：CI 先 gzip -1 再发（跨境上行实测 ~20 KB/s，4.3MB→1.7MB，省一半以上时间）。
+  # 用**魔数**判定而不是看扩展名 —— 老版本 caller 直接发裸 tar 也要能收。
+  if [[ "$(od -An -tx1 -N2 "$raw" 2>/dev/null | tr -d ' \n')" == "1f8b" ]]; then
+    if ! gzip -dc "$raw" > "$STAGED_TAR" 2>/dev/null; then
+      rm -f "$raw" "$STAGED_TAR"; STAGED_TAR=""
+      die "源码包解压失败，已中止（线上源码与回滚点均未动）" 2
+    fi
+    rm -f "$raw"
+  else
+    mv "$raw" "$STAGED_TAR"
   fi
   if ! tar tf "$STAGED_TAR" >/dev/null 2>&1; then
     rm -f "$STAGED_TAR"; STAGED_TAR=""

@@ -92,12 +92,15 @@ jobs:
           echo "排除：${EX:-无}"
           pathspec=()
           for p in $EX; do pathspec+=(":(exclude)$p"); done
-          git archive --format=tar HEAD -o /tmp/src.tar -- . "${pathspec[@]}"
-          ls -lh /tmp/src.tar
+          # 先压缩再发：跨境上行实测 ~20 KB/s，是整条链路最慢的一环。
+          # gzip -1 对源码有 2.5× 左右收益（暖帖 4.3MB → 1.7MB），解压成本可忽略。
+          # 服务器侧按魔数识别，老 caller 发裸 tar 也照样能收。
+          git archive --format=tar HEAD -- . "${pathspec[@]}" | gzip -1 > /tmp/src.tar.gz
+          ls -lh /tmp/src.tar.gz
           # 源码从 stdin 交给部署器：同步、构建、切换在同一把锁内完成。
           # 拆成两条 ssh 的话，两个部署能交叉写同一个 SOURCE_DIR。
           ssh target "sudo -n /opt/deploy/bin/deploy.sh deploy ${{ inputs.project }} \
-            --build --sha ${{ inputs.sha }} --tar - ${{ inputs.skip_selfcheck && '--skip-selfcheck' || '' }}" < /tmp/src.tar
+            --build --sha ${{ inputs.sha }} --tar - ${{ inputs.skip_selfcheck && '--skip-selfcheck' || '' }}" < /tmp/src.tar.gz
 
       - name: 部署后状态
         if: always()
