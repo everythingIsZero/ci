@@ -1,0 +1,62 @@
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        required: true
+        type: string
+      skip_selfcheck:
+        default: false
+        type: boolean
+    secrets:
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_SSH_HOST:
+        required: true
+      DEPLOY_SSH_USER:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: deploy-${{ inputs.project }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-${{ inputs.project }}
+          path: /tmp
+
+      - name: 配置 SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.DEPLOY_SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          cat >> ~/.ssh/config <<EOF
+          Host target
+            HostName ${{ secrets.DEPLOY_SSH_HOST }}
+            User ${{ secrets.DEPLOY_SSH_USER }}
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking accept-new
+          EOF
+
+      - name: 连通性预检
+        run: ssh -o ConnectTimeout=15 target 'echo SSH_OK && sudo -n docker version --format "{{.Server.Version}}"'
+
+      - name: 传输镜像
+        run: |
+          ls -lh /tmp/image.tar.gz
+          gunzip -c /tmp/image.tar.gz | ssh target 'sudo -n docker load'
+
+      - name: 部署（自检 → 切换 → 验收 → 失败回滚）
+        run: |
+          ssh target "sudo -n /opt/deploy/bin/deploy.sh deploy ${{ inputs.project }} \
+            --sha ${GITHUB_SHA} ${{ inputs.skip_selfcheck && '--skip-selfcheck' || '' }}"
+
+      - name: 部署后状态
+        if: always()
+        run: ssh target "sudo -n /opt/deploy/bin/deploy.sh status ${{ inputs.project }}" || true
