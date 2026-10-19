@@ -295,6 +295,97 @@ wait_ready() {
   return 1
 }
 
+# ---------- 产物契约：压缩 / 缓存 ----------
+# 判据写死在这里，不靠人记。压缩与缓存问题反复出现的根因是「只探一个资源 + 只打公网
+# + 缺头只 warn」——Caddy 的 encode 会盖住容器没开压缩，抽样一个又可能正好挑到正常的那个。
+asset_headers() { curl -s -m 10 -o /dev/null -D - -H 'Accept-Encoding: gzip, br' "$1" 2>/dev/null | tr -d '\r'; }
+asset_h() { asset_headers "$1" | grep -iE "^$2:" | tail -1 | cut -d: -f2- | sed 's/^ *//'; }
+
+# ASSET_CONTRACT=warn（默认，只报告）| enforce（计入失败 → 会触发回滚）
+# 存量项目先 warn，修干净后再改 enforce —— 否则一次部署会因为历史遗留的头直接回滚。
+verify_assets() {
+  local base="$1" ip="$2" mode="${ASSET_CONTRACT:-warn}" bad=0
+  local cc ce a url ext name m len hashed picked cce
+
+  step "验收 L2：产物契约（压缩 / 缓存）"
+  if [[ "$mode" == "enforce" ]]; then echo "  模式 enforce（不满足即失败）"; else echo "  模式 warn（只报告，不阻断本次部署）"; fi
+
+  # 入口页：必须有策略；浏览器只看 max-age，s-maxage 只对 CDN 生效
+  cc="$(asset_h "$base/" cache-control)"
+  ce="$(asset_h "$base/" content-encoding)"
+  if [[ -z "$cc" ]]; then
+    c_red "  入口页无 cache-control —— 浏览器会启发式缓存"; bad=1
+  elif grep -qiE 'no-store|no-cache' <<<"$cc"; then
+    ok "入口页 ${cc}"
+  else
+    m="$(grep -oiE '(^|[ ,])max-age=[0-9]+' <<<"$cc" | head -1 | grep -oE '[0-9]+')"
+    if [[ -n "$m" && "$m" -gt 300 ]]; then
+      c_red "  入口页浏览器长缓存（${cc}）—— 发版后老用户会一直拿到旧 HTML"; bad=1
+    elif [[ -z "$m" ]]; then
+      warn "入口页只有 s-maxage、无 max-age/no-cache（${cc}）—— 浏览器侧走启发式缓存"
+    else
+      ok "入口页 ${cc}"
+    fi
+  fi
+  [[ -n "$ce" ]] && ok "入口页已压缩（${ce}）" || { c_red "  入口页未压缩"; bad=1; }
+
+  # 资源抽样：js / css / 图片 各取 1 个（不再只探一个）
+  for ext in js css png svg; do
+    picked=""
+    while IFS= read -r a; do [[ "$a" == *".$ext" ]] && { picked="$a"; break; }; done \
+      < <(curl -s -m 10 "$base/" | grep -oE "/[^\"' <>]+\.${ext}" | awk '!s[$0]++')
+    [[ -z "$picked" ]] && continue
+    url="${base}${picked}"
+    cc="$(asset_h "$url" cache-control)"
+    ce="$(asset_h "$url" content-encoding)"
+    len="$(curl -s -m 10 -o /dev/null -w '%{size_download}' "$url" 2>/dev/null || echo 0)"
+    name="${picked##*/}"
+    hashed=0
+    if [[ "$name" =~ [.-][A-Za-z0-9_-]{8,}\.(js|css|png|svg|woff2|webp)$ || "$name" =~ ^[0-9a-f]{8,}\.(js|css|png|svg|woff2|webp)$ ]]; then hashed=1; fi
+
+    # 压缩：文本类必须；小于 1KB 不要求（压了反而更大）
+    if [[ "$ext" =~ ^(js|css|svg)$ && "${len:-0}" -gt 1024 ]]; then
+      if [[ -n "$ce" ]]; then ok "${picked} 已压缩（${ce}）"; else c_red "  ${picked} 未压缩（${len}B）"; bad=1; fi
+    fi
+
+    # 缓存：带 hash 才能长缓存；不带 hash 必须短缓存 + 重验证
+    if [[ -z "$cc" ]]; then
+      c_red "  ${picked} 无 cache-control —— 每次访问都要重新下载"; bad=1
+    elif [[ "$hashed" == "1" ]]; then
+      if grep -qi immutable <<<"$cc" || { m="$(grep -oiE 'max-age=[0-9]+' <<<"$cc" | head -1 | cut -d= -f2)"; [[ -n "$m" && "$m" -ge 2592000 ]]; }; then
+        ok "${picked} 长缓存（${cc}）"
+      else
+        c_red "  ${picked} 带 hash 却缓存过短（${cc}）"; bad=1
+      fi
+    else
+      m="$(grep -oiE 'max-age=[0-9]+' <<<"$cc" | head -1 | cut -d= -f2)"
+      if grep -qiE 'no-store|no-cache' <<<"$cc" || [[ -n "$m" && "$m" -le 3600 ]]; then
+        ok "${picked} 短缓存（${cc}，文件名无 hash，正确）"
+      else
+        c_red "  ${picked} 文件名无 hash 却长缓存（${cc}）—— 发版后用户会拿到旧文件"; bad=1
+      fi
+    fi
+  done
+
+  # 压缩归属：容器自己开没开（公网压缩可能只是 Caddy 兜的）
+  if [[ -n "$ip" ]]; then
+    cce="$(asset_h "http://${ip}:${PORT}/" content-encoding)"
+    if [[ -n "$cce" ]]; then
+      ok "容器自身已压缩（${cce}）"
+    elif [[ -n "$ce" ]]; then
+      warn "容器自身未压缩、公网压缩由 Caddy 兜底 —— Caddy 配置一改就裸传"
+    else
+      c_red "  容器与公网都未压缩"; bad=1
+    fi
+  fi
+
+  if [[ "$bad" == "1" && "$mode" != "enforce" ]]; then
+    warn "产物契约有未满足项（warn 模式，不影响本次部署）"
+    return 0
+  fi
+  return "$bad"
+}
+
 # ---------- 验收：三层 ----------
 verify() {
   local p="$1" base="https://${DOMAIN}" code fail=0
@@ -332,27 +423,7 @@ verify() {
   done
 
   if [[ "${CHECK_COMPRESS:-0}" == "1" ]]; then
-    step "验收 L2：产物层（压缩 / 缓存头）"
-    local probe="${COMPRESS_PROBE:-}"
-    if [[ "$probe" == "auto" ]]; then
-      probe="$(curl -s -m 10 "${base}/" | grep -oE '/[^"'"'"' <>]+\.(js|css)' | head -1 || true)"
-      [[ -n "$probe" ]] && echo "  自动选取探测资源：$probe"
-    fi
-    if [[ -n "$probe" ]]; then
-      local hdr; hdr="$(curl -sI -m 10 -H 'Accept-Encoding: gzip, br' "${base}${probe}" || true)"
-      if grep -qi '^content-encoding:' <<<"$hdr"; then
-        ok "${probe} 已压缩（$(grep -i '^content-encoding:' <<<"$hdr" | tr -d '\r')）"
-      else
-        c_red "  ${probe} 未压缩 —— 检查 nginx gzip / Caddy encode"; fail=1
-      fi
-      if grep -qi '^cache-control:' <<<"$hdr"; then
-        ok "cache-control: $(grep -i '^cache-control:' <<<"$hdr" | tr -d '\r' | cut -d: -f2- | xargs)"
-      else
-        warn "缺少 cache-control 头"
-      fi
-    else
-      warn "未配置 COMPRESS_PROBE，跳过压缩检查"
-    fi
+    verify_assets "$base" "$ip" || fail=1
   fi
 
   if [[ -n "${VERSION_PATH:-}" ]]; then

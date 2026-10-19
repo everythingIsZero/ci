@@ -88,6 +88,34 @@ jobs:
 
 ---
 
+## 产物契约基线（2026-10-19 实测）
+
+压缩与缓存问题反复出现的根因不是「谁忘了配」，而是**验收只探一个资源、只打公网域名、缺头只 warn**。
+现在判据写死在 `scripts/audit-assets.sh` 与 `deploy.sh verify` 里，逐条判红绿。
+
+| 域名 | 项目 | 入口压缩 | 资源压缩 | 入口缓存 | 资源缓存 | 结论 |
+|---|---|---|---|---|---|---|
+| www.hxym18.com | home | ✓ | ✓ | `no-cache` | `immutable` | 绿（enforce） |
+| schulte.hxym18.com | schulte-v2 | ✓ | ✓ | `no-store` | `immutable` | 绿（enforce） |
+| ka.hxym18.com | card | ✓（10-19 修） | ✓（10-19 修） | `no-cache` | `immutable` | 绿 |
+| nt.hxym18.com | nuantie | ✓ | ✓ | **无** | **无** | 红 ×4（warn） |
+| gldcd.hxym18.com | zbh | ✓ | ✓ | `no-store` | 短缓存 | 红 ×1（og 图长缓存） |
+| wj.hxym18.com | zitie | ✓ | ✓ | 只有 s-maxage | `immutable` | 黄 |
+| yq.hxym18.com | wordinput | ✓ | ✓ | 只有 s-maxage | `immutable` | 黄 |
+| fang.hxym18.com | fang | ✓ | — | 只有 s-maxage | — | 黄 ×3 |
+| share.hxym18.com | share-bridge | — | — | **无** | — | 302，需人工确认 |
+
+**判据（写死在脚本里，不靠人记）**
+
+1. 入口页必须有 `cache-control`；`max-age > 300` 判红（发版后老用户拿旧 HTML）
+2. 文本类资源 > 1KB 必须压缩
+3. 带内容 hash 的产物 → 必须 `immutable` 或 `max-age ≥ 30 天`
+4. **不带 hash** 的产物 → 必须 `no-cache` 或 `max-age ≤ 1h`（长缓存会让用户拿到旧文件）
+5. 容器直连 vs 公网做**归属比对**：容器压缩、公网不压缩 = 边缘层把它吃了
+
+**接入前置条件**：新项目接入前先跑 `bash scripts/audit-assets.sh <域名>` 到「契约满足」，再在 conf 里设 `ASSET_CONTRACT=enforce`。
+存量项目先设 `warn`（只报告），修干净再改 `enforce` —— 否则一次部署会因为历史遗留的头直接回滚。
+
 ## 接入步骤（照抄）
 
 1. 在 `Projects/ci/projects/<项目>.conf` 新建配置，字段含义：
@@ -108,7 +136,7 @@ PORT=...                       # 容器内端口（旁路自检用）
 HEALTH_PATH=/healthz 或 /
 DOMAIN=...
 CHECK_COMPRESS=1               # 静态资源站点必开
-COMPRESS_PROBE=auto
+ASSET_CONTRACT=warn|enforce    # 产物契约：warn 只报告 · enforce 不满足即失败（会回滚）
 BUILD_ENV_REQUIRED="..."       # compose.yml 的 build.args 依赖的变量名（空格分隔）
                                # 缺了不会报错，只会静默构建出缺配置的镜像 → 这里变硬失败
 DB_PATH=...                    # 有本地数据库时填，部署前会 cp 快照
