@@ -182,7 +182,11 @@ retag() {
 }
 
 # ---------- 备份：切换前先留退路 ----------
-# 分两步，因为「配置/数据备份」必须在源码同步之前，而「回滚 tag」要等构建完
+# 顺序是死的：配置/数据备份 → 回滚点 → 源码同步 → 构建。
+# 回滚点必须在**任何可能改动镜像的操作之前**建 —— 构建会把 <project>:local 重新指向新镜像，
+# 旧镜像随之变悬空。2026-10-19 nuantie 事故：当时的顺序是「先构建、再存回滚点」，
+# 取到的是当前容器引用的镜像 ID，而那个镜像已经不在库里（容器还在跑、镜像没了）→
+# `docker tag` 报 No such image，部署死在 rollback-point 阶段，而且**永远无法成功**。
 # 才能知道新镜像是不是同一个（同 commit 重部署时镜像 ID 不变，此时打 tag 等于
 # 把回滚点指向当前版本，回滚变成空转却报成功）。
 backup_config() {
@@ -221,27 +225,44 @@ backup_config() {
 
 # 只在「新镜像 ≠ 当前运行镜像」时打回滚点；否则保留上一个真正的回滚点
 make_rollback_point() {
-  local p="$1" new_img="$2" dry="${3:-0}" ts cur tag prefix
+  local p="$1" dry="${2:-0}" ts cur tag prefix
   ts="$(date +%Y%m%d-%H%M%S)"
   prefix="${IMAGE_LOCAL%%:*}"
   cur="$(current_image_id)"
+  RB_TAG=""; RB_IMAGE=""
   if [[ -z "$cur" ]]; then
     warn "当前容器不存在或未运行，跳过回滚点（首次部署）"
     state_set "$p" "PREV_TAG=" "PREV_IMAGE="
     return 0
   fi
-  if [[ -n "$new_img" && "$cur" == "$new_img" ]]; then
-    warn "新镜像与当前运行镜像相同（同一提交重部署）—— 保留上一个回滚点，不覆盖"
-    return 0
-  fi
   tag="${prefix}:rollback-${ts}"
   if [[ "$dry" == "1" ]]; then
     echo "  (dry-run) 将保存回滚点 ${tag} → ${cur:0:19}"
+    RB_TAG="$tag"; RB_IMAGE="$cur"
     return 0
   fi
-  retag "$cur" "$tag"
-  state_set "$p" "PREV_TAG=$tag" "PREV_IMAGE=$cur"
-  ok "回滚点已保存：$tag"
+  if ! retag "$cur" "$tag"; then
+    # 镜像已被清掉（容器还在跑、镜像库里没有）→ 本次没有可回滚的版本。
+    # **不能因此中止部署**：那等于「删过一次镜像 = 以后永远不能部署」。
+    c_red "  当前容器引用的镜像 ${cur:0:19} 已不在镜像库，本次部署没有回滚点"
+    state_set "$p" "PREV_TAG=" "PREV_IMAGE="
+    return 0
+  fi
+  RB_TAG="$tag"; RB_IMAGE="$cur"
+  ok "回滚点已保存：$tag（${cur:0:19}）"
+}
+
+# 构建后收口：新镜像与部署前镜像相同时，回滚点就是新镜像本身 —— 留着会让「回滚」
+# 变成「再起一遍同一个镜像」。删掉它，并保留上一个真正不同的回滚点。
+commit_rollback_point() {
+  local p="$1" new_img="$2" dry="${3:-0}"
+  [[ -z "${RB_TAG:-}" || "$dry" == "1" ]] && return 0
+  if [[ -n "$new_img" && "$new_img" == "$RB_IMAGE" ]]; then
+    $DOCKER rmi "$RB_TAG" >/dev/null 2>&1 || true
+    warn "新镜像与部署前镜像相同（同一提交重部署）—— 已丢弃多余回滚点，保留上一个"
+    return 0
+  fi
+  state_set "$p" "PREV_TAG=$RB_TAG" "PREV_IMAGE=$RB_IMAGE"
 }
 
 # ---------- 旁路自检：不碰线上容器、不碰生产端口 ----------
@@ -556,6 +577,11 @@ cmd_deploy() {
   DEPLOY_STAGE="backup"
   backup_config "$p" "$dry_run"
 
+  # 回滚点紧接备份：此时旧镜像一定还在（还没构建、还没重新打 tag）。
+  # 顺序理由见 backup 段落上方的注释 —— 放错位置会让部署永久失败。
+  DEPLOY_STAGE="rollback-point"
+  make_rollback_point "$p" "$dry_run"
+
   # 同步紧跟备份、且都在锁内：不会出现「A 同步完、B 又同步、A 构建的是 B 的源码」
   # dry-run 不动线上源码（否则演练会把生产源码换成未验证的提交）
   if [[ -n "$STAGED_TAR" && "$dry_run" != "1" ]]; then
@@ -578,9 +604,8 @@ cmd_deploy() {
     target="$IMAGE_LOCAL"
   fi
 
-  # 回滚点：构建完才知道新镜像 ID；同镜像重部署时不能覆盖上一个真正的回滚点
-  DEPLOY_STAGE="rollback-point"
-  make_rollback_point "$p" "$($DOCKER image inspect -f '{{.Id}}' "$target" 2>/dev/null || true)" "$dry_run"
+  # 构建完才知道新镜像 ID → 收口回滚点（同镜像重部署时丢弃多余的那一个）
+  commit_rollback_point "$p" "$($DOCKER image inspect -f '{{.Id}}' "$target" 2>/dev/null || true)" "$dry_run"
 
   if [[ "$skip_selfcheck" == "0" ]]; then
     DEPLOY_STAGE="selfcheck"
