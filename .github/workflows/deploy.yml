@@ -49,12 +49,15 @@ jobs:
       - name: 连通性预检
         run: ssh target 'echo SSH_OK && sudo -n docker version --format "{{.Server.Version}}"'
 
-      - name: 同步源码（tar 单流；rsync 逐文件跨境往返太慢）
+      - name: 同步源码（tar 单流；只带运行时需要的文件）
         run: |
           TARGET=$(ssh target "sudo -n /opt/deploy/bin/deploy.sh where ${{ inputs.project }}")
           [ -n "$TARGET" ] || { echo "::error::conf 里没有 SOURCE_DIR"; exit 1; }
-          echo "同步到 $TARGET"
-          git archive --format=tar HEAD -o /tmp/src.tar
+          EX=$(ssh target "sudo -n /opt/deploy/bin/deploy.sh excludes ${{ inputs.project }}")
+          echo "同步到 $TARGET；排除：${EX:-无}"
+          pathspec=()
+          for p in $EX; do pathspec+=(":(exclude)$p"); done
+          git archive --format=tar HEAD -o /tmp/src.tar -- . "${pathspec[@]}"
           ls -lh /tmp/src.tar
           ssh target "sudo -n find '$TARGET' -mindepth 1 -maxdepth 1 ! -name node_modules -exec rm -rf {} +"
           ssh target "sudo -n tar x -C '$TARGET' --no-same-owner" < /tmp/src.tar

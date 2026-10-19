@@ -406,6 +406,8 @@ cmd_selfcheck() {
 
 cmd_where() { load_conf "$1"; echo "${SOURCE_DIR:-}"; }
 
+cmd_excludes() { load_conf "$1"; echo "${EXCLUDE_PATHS:-}"; }
+
 cmd_list() {
   step "已接入项目"
   for f in "$CONF_DIR"/*.conf; do
@@ -435,6 +437,7 @@ main() {
     verify)   [[ $# -ge 1 ]] || die "用法：deploy.sh verify <project>" 2; cmd_verify "$@" ;;
     selfcheck) [[ $# -ge 1 ]] || die "用法：deploy.sh selfcheck <project> [image]" 2; cmd_selfcheck "$@" ;;
     where)    [[ $# -ge 1 ]] || die "用法：deploy.sh where <project>" 2; cmd_where "$@" ;;
+    excludes) [[ $# -ge 1 ]] || die "用法：deploy.sh excludes <project>" 2; cmd_excludes "$@" ;;
     list)     cmd_list ;;
     *) sed -n '2,20p' "$0"; exit 2 ;;
   esac
