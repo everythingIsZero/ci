@@ -132,7 +132,22 @@ backup_current() {
     return 0
   fi
   retag "$cur" "$tag"
-  state_set "$p" "PREV_TAG=$tag" "PREV_IMAGE=$cur"
+
+  # 镜像之外还要备份「配置与数据」：compose 文件在 SOURCE_DIR 内会被同步覆盖，
+  # 只还原镜像不还原 compose，等于用坏配置再启一次。
+  local bak="$DEPLOY_ROOT/backups/$p/$ts"
+  mkdir -p "$bak" 2>/dev/null || true
+  if [[ -f "${COMPOSE_FILE:-}" ]]; then
+    cp "$COMPOSE_FILE" "$bak/compose.yml" 2>/dev/null && ok "compose 已备份"
+  elif [[ -f "${STACK_FILE:-}" ]]; then
+    cp "$STACK_FILE" "$bak/stack.yml" 2>/dev/null && warn "集中栈 compose 已备份（回滚不自动还原，避免波及同栈其他服务）"
+  fi
+  if [[ -n "${DB_PATH:-}" && -f "${DB_PATH:-}" ]]; then
+    cp "$DB_PATH" "$bak/" 2>/dev/null && ok "数据库已备份（cp 快照，WAL 模式下不保证一致）" \
+      || warn "数据库备份失败：$DB_PATH"
+  fi
+
+  state_set "$p" "PREV_TAG=$tag" "PREV_IMAGE=$cur" "PREV_DIR=$bak"
   ok "回滚点已保存：$tag"
 }
 
@@ -189,18 +204,40 @@ selfcheck() {
 }
 
 wait_ready() {
-  local i st
+  local i st code
   for ((i = 0; i < 45; i++)); do
-    st="$($DOCKER inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$CONTAINER" 2>/dev/null || echo unknown)"
+    st="$($DOCKER inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER" 2>/dev/null || echo unknown)"
     case "$st" in
-      healthy|running)
-        ok "容器就绪（${st}，等待 ${i}s）"
+      healthy)
+        ok "容器就绪（healthy，等待 ${i}s）"
         return 0
+        ;;
+      starting)
+        sleep 1
+        continue
+        ;;
+      unhealthy)
+        c_red "容器健康检查失败（unhealthy）"
+        $DOCKER logs --tail 30 "$CONTAINER" 2>&1 | sed 's/^/    /' || true
+        return 1
+        ;;
+      none)
+        # 没有 HEALTHCHECK 的容器：running ≠ 应用就绪，必须实打实探活
+        code="$(curl -s -o /dev/null -m 3 -w '%{http_code}' "https://${DOMAIN}${HEALTH_PATH}" 2>/dev/null || echo 000)"
+        if [[ "$code" == "200" ]]; then
+          ok "容器就绪（无 healthcheck，${HEALTH_PATH} 返回 200，等待 ${i}s）"
+          return 0
+        fi
+        ;;
+      exited|dead)
+        c_red "容器已退出（${st}）"
+        $DOCKER logs --tail 30 "$CONTAINER" 2>&1 | sed 's/^/    /' || true
+        return 1
         ;;
     esac
     sleep 1
   done
-  c_red "容器 45 秒内未就绪（最后状态 ${st}）"
+  c_red "容器 45 秒内未就绪（最后状态 ${st}，HTTP ${code:-无}）"
   $DOCKER logs --tail 30 "$CONTAINER" 2>&1 | sed 's/^/    /' || true
   return 1
 }
@@ -368,6 +405,10 @@ cmd_rollback() {
   $DOCKER image inspect "$prev" >/dev/null 2>&1 || die "回滚镜像 $prev 已被清理" 2
 
   step "回滚 ${PROJECT} → ${prev}"
+  local bak; bak="$(state_get "$p" PREV_DIR)"
+  if [[ "$MODE" == "self-compose" && -n "$bak" && -f "$bak/compose.yml" ]]; then
+    cp "$bak/compose.yml" "$COMPOSE_FILE" 2>/dev/null && ok "已还原部署前的 compose"
+  fi
   retag "$prev" "$IMAGE_LOCAL"
   compose_up || die "回滚切换失败，需人工介入" 1
   ok "已回滚到 ${prev}"
@@ -404,7 +445,20 @@ cmd_selfcheck() {
   selfcheck "$p" "$img" && ok "自检通过"
 }
 
-cmd_where() { load_conf "$1"; echo "${SOURCE_DIR:-}"; }
+cmd_where() {
+  load_conf "$1"
+  local sd="${SOURCE_DIR:-}"
+  # 护栏：SOURCE_DIR 会被 CI 清空重解压，写错一层就是删库
+  [[ -n "$sd" ]] || die "conf 缺 SOURCE_DIR" 2
+  [[ "$sd" =~ ^/opt/[A-Za-z0-9._-]+/.+ ]] || die "SOURCE_DIR 必须是 /opt/<项目>/<子目录>，当前为 $sd" 2
+  if [[ -n "${ENV_FILE:-}" && "$ENV_FILE" == "$sd"/* ]]; then
+    die "ENV_FILE 位于 SOURCE_DIR 内，同步会删掉密钥：$ENV_FILE" 2
+  fi
+  if [[ -n "${DB_PATH:-}" && "$DB_PATH" == "$sd"/* ]]; then
+    die "DB_PATH 位于 SOURCE_DIR 内，同步会删掉数据：$DB_PATH" 2
+  fi
+  echo "$sd"
+}
 
 cmd_excludes() { load_conf "$1"; echo "${EXCLUDE_PATHS:-}"; }
 
@@ -428,11 +482,36 @@ cleanup_old() {
   done <<<"$tags"
 }
 
+cmd_cleanup() {
+  step "清理悬空镜像"
+  $DOCKER image prune -f 2>&1 | tail -2
+  local f p
+  for f in "$CONF_DIR"/*.conf; do
+    [[ -e "$f" ]] || continue
+    p="$(basename "$f" .conf)"
+    load_conf "$p"
+    cleanup_old "$p"
+  done
+  echo
+  df -h / | tail -1
+}
+
 main() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    deploy)   [[ $# -ge 1 ]] || die "用法：deploy.sh deploy <project>" 2; cmd_deploy "$@" ;;
-    rollback) [[ $# -ge 1 ]] || die "用法：deploy.sh rollback <project>" 2; cmd_rollback "$@" ;;
+    deploy)
+      [[ $# -ge 1 ]] || die "用法：deploy.sh deploy <project>" 2
+      exec 9>"$DEPLOY_ROOT/.deploy.lock"
+      flock -w "${LOCK_WAIT:-10}" 9 || die "另一个部署正在进行（锁 $DEPLOY_ROOT/.deploy.lock），稍后重试" 2
+      cmd_deploy "$@"
+      ;;
+    rollback)
+      [[ $# -ge 1 ]] || die "用法：deploy.sh rollback <project>" 2
+      exec 9>"$DEPLOY_ROOT/.deploy.lock"
+      flock -w "${LOCK_WAIT:-10}" 9 || die "另一个部署正在进行，稍后重试" 2
+      cmd_rollback "$@"
+      ;;
+    cleanup)  cmd_cleanup ;;
     status)   [[ $# -ge 1 ]] || die "用法：deploy.sh status <project>" 2; cmd_status "$@" ;;
     verify)   [[ $# -ge 1 ]] || die "用法：deploy.sh verify <project>" 2; cmd_verify "$@" ;;
     selfcheck) [[ $# -ge 1 ]] || die "用法：deploy.sh selfcheck <project> [image]" 2; cmd_selfcheck "$@" ;;

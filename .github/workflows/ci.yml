@@ -30,6 +30,9 @@ on:
       push_image:
         default: false
         type: boolean
+      verify_dockerfile:
+        default: false
+        type: boolean
     secrets:
       NPM_TOKEN:
         required: false
@@ -50,6 +53,9 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-${{ inputs.project }}-${{ github.ref }}
+      cancel-in-progress: true
     outputs:
       image: ${{ steps.meta.outputs.image }}
       sha: ${{ steps.meta.outputs.sha }}
@@ -90,6 +96,7 @@ jobs:
         run: eval "${{ inputs.gate_cmd }}"
 
       - name: 构建镜像
+        if: inputs.push_image || inputs.verify_dockerfile
         run: |
           args=()
           while IFS= read -r line; do

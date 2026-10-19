@@ -84,6 +84,7 @@ jobs:
 - 依赖装在 `apps/client`，`install_cmd` 必须指定 `pnpm -C apps/client install --frozen-lockfile`
 - 旧容器 `schulte`（`schulte:local`）仍在跑，退役前不要动
 - 构建含「缓存安全门」：产物不带内容 hash 会直接构建失败
+- 源码 16MB，其中设计稿/参考图/报告占 12MB —— `EXCLUDE_PATHS` 排除后只剩 3.3MB
 
 ---
 
@@ -101,7 +102,8 @@ SERVICE=...                    # compose 里的服务名
 CONTAINER=...                  # docker ps 里的容器名
 IMAGE_LOCAL=...                # compose 里 image 字段（central-stack 为 deploy-<svc>:latest）
 ENV_FILE=...                   # 服务器 .env 绝对路径；无则留空
-SOURCE_DIR=...                 # 源码同步目标，rsync --delete 的作用范围
+SOURCE_DIR=...                 # 源码同步目标，清空重解压的作用范围
+EXCLUDE_PATHS="docs deliverables reference"   # 非运行时目录，打包时就排除
 PORT=...                       # 容器内端口（旁路自检用）
 HEALTH_PATH=/healthz 或 /
 DOMAIN=...
