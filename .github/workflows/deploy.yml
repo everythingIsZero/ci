@@ -23,6 +23,9 @@ on:
         required: true
       DEPLOY_SSH_USER:
         required: true
+      # 必须声明，否则 caller 传了也进不来（未声明的 secret 在 workflow_call 里不可见）
+      DEPLOY_SSH_HOST_FP:
+        required: false
 
 jobs:
   deploy:
