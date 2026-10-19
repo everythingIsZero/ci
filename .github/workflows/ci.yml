@@ -109,6 +109,7 @@ jobs:
             --format '镜像大小 {{.Size}} bytes · 入口 {{.Config.Cmd}}'
 
       - name: 镜像结构冒烟
+        if: inputs.push_image || inputs.verify_dockerfile
         run: |
           img="${{ steps.meta.outputs.image }}"
           docker run --rm --entrypoint sh "$img" -c 'echo 镜像可执行' \

@@ -247,6 +247,17 @@ verify() {
   local p="$1" base="https://${DOMAIN}" code fail=0
   step "验收 L1：基础可用"
 
+  # 先直连容器，确认「新容器自己在服务」——只打公网域名的话，
+  # Caddy 还指向旧容器时会验出假绿。
+  local ip
+  ip="$($DOCKER inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CONTAINER" 2>/dev/null)"
+  if [[ -n "$ip" ]]; then
+    code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${ip}:${PORT}${HEALTH_PATH}" || echo 000)"
+    if [[ "$code" == "200" ]]; then ok "容器直连 ${HEALTH_PATH} → 200"; else c_red "容器直连 ${HEALTH_PATH} → ${code}"; fail=1; fi
+  else
+    warn "拿不到容器 IP，跳过直连检查"
+  fi
+
   for path in $(printf '%s\n' "/" "$HEALTH_PATH" $SMOKE_PATHS | awk '!seen[$0]++'); do
     [[ -z "$path" ]] && continue
     code="$(curl -s -o /dev/null -m 10 -w '%{http_code}' "${base}${path}" || echo 000)"
