@@ -88,6 +88,10 @@ jobs:
 
       - name: 同步源码 + 构建 + 部署（同步在锁内 → 自检 → 切换 → 验收 → 失败回滚）
         run: |
+          # pipefail：`git archive | gzip` 里 git 失败会被 gzip 的成功掩盖，
+          # 结果就是发出一个 20 字节的空 gzip，服务器才报「源码包为空」——
+          # 错误现场离根因隔了两层，16:55 那次 home 部署就是这么白失败一次。
+          set -o pipefail
           EX=$(ssh target "sudo -n /opt/deploy/bin/deploy.sh excludes ${{ inputs.project }}")
           echo "排除：${EX:-无}"
           pathspec=()
