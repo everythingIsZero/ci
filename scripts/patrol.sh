@@ -78,7 +78,22 @@ for f in "$CONF_DIR"/*.conf; do
 
   block="$(awk -v k="### $p" '$0==k{f=1;next} /^### /{f=0} f' <<<"$STATE_RAW")"
   if [[ -z "$block" ]]; then
-    red "服务器上没有该项目的 state（从未部署过？）"
+    # 没有 state 有两种完全不同的含义，不能一律判红：
+    #   ① 刚接入、还没部署过 —— 这是正常中间态，判红会让巡检永远红，红项就失去信号价值
+    #   ② workflow 报过 success 却没有 state —— 部署没真正落地，这是事故
+    # 用 GitHub 的运行记录来区分，而不是靠猜。
+    runs0="$(gh run list -R "$OWNER/$repo" --limit 5 \
+      --json conclusion,event,headSha,createdAt \
+      --jq '.[] | "\(.conclusion // "running")\t\(.event)\t\(.headSha[0:7])\t\(.createdAt)"' 2>/dev/null)"
+    if [[ -z "$runs0" ]]; then
+      ylw "已配置、尚未部署过（仓库里没有运行记录）"
+    elif grep -qE '^success\b' <<<"$runs0"; then
+      red "workflow 报过成功，但服务器上没有 state —— 部署没有真正落地"
+    elif grep -qE '^(failure|startup_failure)\b' <<<"$runs0"; then
+      red "部署从未成功（有 failure/startup_failure），服务器上也没有 state"
+    else
+      ylw "已配置、尚无部署结果（服务器上还没有 state）"
+    fi
     continue
   fi
   g() { sed -n "s/^ *$1=//p" <<<"$block" | head -1; }
