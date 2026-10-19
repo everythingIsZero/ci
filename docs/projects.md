@@ -11,13 +11,17 @@
 | nuantie | self-compose | `/opt/nuantie/app` | `nuantie` | nt.hxym18.com | ✅ |
 | home | central-stack | `/opt/home/releases/20261005` | `home` | www.hxym18.com | ✅ |
 | schulte-v2 | self-compose | `/opt/schulte/app` | `schulte-v2` | schulte.hxym18.com | ✅ |
-| card | self-compose | `/opt/card/app` | `card` | ka.hxym18.com | ⬜ |
-| share-bridge | self-compose | `/opt/share-bridge/app` | `share-bridge` | share.hxym18.com | ⬜ |
-| zbh | central-stack | `/opt/trae-projects/apps/zbh` | `zbh` | gldcd.hxym18.com | ⬜ |
-| fang | central-stack | `/opt/fang/releases/umami-gate-20261008` | `fang` | fang.hxym18.com | ⬜ |
-| zitie | central-stack | `/opt/zitie/releases/20261008` | `copybook` | wj.hxym18.com | ⬜ |
-| wordinput | central-stack | `/opt/wordinput/releases/20260930` | `wordinput` | yq.hxym18.com | ⬜ |
+| card | self-compose | `/opt/card/app` | `card` | ka.hxym18.com | 🔄 配置已就位、未部署 |
+| share-bridge | self-compose | `/opt/share-bridge/app` | `share-bridge` | share.hxym18.com | 🔄 配置已就位、未部署 |
+| zbh | central-stack | `/opt/trae-projects/apps/zbh` | `zbh` | gldcd.hxym18.com | 🔄 配置已就位、未部署 |
+| fang | central-stack | `/opt/fang/releases/umami-gate-20261008` | `fang` | fang.hxym18.com | 🔄 配置已就位、未部署 |
+| zitie | central-stack | `/opt/zitie/releases/20261008` | `copybook` | wj.hxym18.com | 🔄 配置已就位、未部署 |
+| wordinput | central-stack | `/opt/wordinput/releases/20260930` | `wordinput` | yq.hxym18.com | 🔄 配置已就位、未部署 |
 | sso-bridge | 特殊（compose 在根） | `/opt/sso-bridge` | `sso-unified-next` | auth / bridge / id | ⛔ |
+
+> **🔄 = 配置/工作流/密钥都已就位，但一次都还没部署过。** 触发部署 = `gh workflow run deploy.yml -R everythingIsZero/<repo> --ref main`，
+> 会重建容器（有回滚点、失败自动回退），**不是无副作用的操作** —— 谁决定部署、什么时候部署，得有人拍板。
+> 这 6 个都跑过 `deploy.sh deploy <p> --build --dry-run`（只打印不执行）与旁路自检，路径与 compose 解析都验过。
 
 ## B 类：共享包（只要 CI，不部署）
 
@@ -59,6 +63,12 @@ jobs:
 - 集中栈服务名 `zbh`，容器 `deploy-zbh-1`，镜像自动名 `deploy-zbh:latest`
 - ⚠️ `pnpm-lock.yaml` 里曾出现 `git+ssh://` 形式的 GitHub 依赖导致构建失败（已修）；接入后每次构建都会复现该检查
 - 有 `lint` 脚本，`gate_cmd` 建议 `pnpm lint && pnpm test`
+- ⚠️ **原 Dockerfile 是 `COPY dist ./dist`，而 `dist/` 在 `.gitignore` 里** —— 它只能在那台「历史上恰好 build 过」的服务器上构建成功。
+  2026-10-19 接 CD 时实际撞到：`failed to compute cache key: "/dist": not found`（源码目录被清空后 `dist` 就没了）。
+  已改多阶段（builder 里 `pnpm build`，运行阶段 `COPY --from=builder`），并在 `.dockerignore` 里排除 `dist`/`deliverables`，
+  防止宿主机残留产物混进构建上下文（否则会「用旧 dist 打新镜像」）。
+- ⚠️ `scripts/postbuild-css.mjs` import 了 `lightningcss` / `browserslist` 但没在 `package.json` 声明 ——
+  本地能跑只是因为被 pnpm 提升到了顶层；`--frozen-lockfile` 的镜像里装不到。已补为 devDependencies（锁定文件只增两行，无版本漂移）。
 
 ### fang
 - 集中栈服务名 `fang`，容器 `deploy-fang-1`
