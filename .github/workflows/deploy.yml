@@ -12,6 +12,10 @@ on:
       skip_selfcheck:
         default: false
         type: boolean
+      allowed_branch:
+        description: 允许部署的分支（空 = 不限制）。防止 workflow_dispatch 选个未合并的 feature 分支直上生产
+        default: main
+        type: string
     secrets:
       DEPLOY_SSH_KEY:
         required: true
@@ -34,18 +38,41 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: 分支校验
+        if: inputs.allowed_branch != ''
+        run: |
+          ref="${GITHUB_REF#refs/heads/}"
+          if [ "$ref" != "${{ inputs.allowed_branch }}" ]; then
+            echo "::error::只允许从 ${{ inputs.allowed_branch }} 部署，当前分支 $ref"
+            exit 1
+          fi
+          echo "分支 $ref 允许部署"
+
       - name: 配置 SSH
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ secrets.DEPLOY_SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          # 主机密钥校验：ssh-keyscan 本身不带认证，直接信任等于把 tar 包交给可能的中间人。
+          # 若配了 DEPLOY_SSH_HOST_FP（ssh-keygen -lf 的第二列），就必须对上才继续。
+          ssh-keyscan -H "${{ secrets.DEPLOY_SSH_HOST }}" > /tmp/kh 2>/dev/null
+          FP="${{ secrets.DEPLOY_SSH_HOST_FP }}"
+          if [ -n "$FP" ]; then
+            got=$(ssh-keygen -lf /tmp/kh | awk '{print $2}' | sort -u | tr '\n' ' ')
+            case " $got " in
+              *" $FP "*) echo "主机密钥指纹匹配" ;;
+              *) echo "::error::主机密钥指纹不匹配（期望 $FP，实际 $got）"; exit 1 ;;
+            esac
+          else
+            echo "::warning::未配置 DEPLOY_SSH_HOST_FP，主机密钥未校验（建议补上）"
+          fi
+          cat /tmp/kh >> ~/.ssh/known_hosts
           cat >> ~/.ssh/config <<EOF
           Host target
             HostName ${{ secrets.DEPLOY_SSH_HOST }}
             User ${{ secrets.DEPLOY_SSH_USER }}
             IdentityFile ~/.ssh/deploy_key
-            StrictHostKeyChecking accept-new
+            StrictHostKeyChecking yes
             ConnectTimeout 20
             ServerAliveInterval 15
           EOF
