@@ -1,0 +1,121 @@
+# 项目接入矩阵
+
+接入 CI/CD 的逐项目清单。**接入前先看本项目的「特别注意」**，那里是最容易踩的坑。
+
+图例：✅ 已验证跑通 · 🔄 接入中 · ⬜ 待接入 · ⛔ 不建议自动部署
+
+## A 类：有生产容器（需要 CD）
+
+| 项目 | 形态 | SOURCE_DIR | SERVICE | 域名 | 状态 |
+|---|---|---|---|---|---|
+| nuantie | self-compose | `/opt/nuantie/app` | `nuantie` | nt.hxym18.com | ✅ |
+| home | central-stack | `/opt/home/releases/20261005` | `home` | www.hxym18.com | ✅ |
+| schulte-v2 | self-compose | `/opt/schulte/app` | `schulte-v2` | schulte.hxym18.com | 🔄 |
+| card | self-compose | `/opt/card/app` | `card` | ka.hxym18.com | ⬜ |
+| share-bridge | self-compose | `/opt/share-bridge/app` | `share-bridge` | share.hxym18.com | ⬜ |
+| zbh | central-stack | `/opt/trae-projects/apps/zbh` | `zbh` | gldcd.hxym18.com | ⬜ |
+| fang | central-stack | `/opt/fang/releases/umami-gate-20261008` | `fang` | fang.hxym18.com | ⬜ |
+| zitie | central-stack | `/opt/zitie/releases/20261008` | `copybook` | wj.hxym18.com | ⬜ |
+| wordinput | central-stack | `/opt/wordinput/releases/20260930` | `wordinput` | yq.hxym18.com | ⬜ |
+| sso-bridge | 特殊（compose 在根） | `/opt/sso-bridge` | `sso-unified-next` | auth / bridge / id | ⛔ |
+
+## B 类：共享包（只要 CI，不部署）
+
+`env` · `auth` · `analytics` · `share-kit` · `pwa-kit` · `cli`
+
+这些的「上线」= 打 tag 被别的项目 `github:owner/repo#vX.Y.Z` 引用。接入只需 CI 门禁：
+
+```yaml
+jobs:
+  ci:
+    uses: everythingIsZero/ci/.github/workflows/ci.yml@main
+    with:
+      project: env
+      push_image: false
+    secrets: inherit
+```
+
+不需要 `deploy` job，也不需要 conf。
+
+## C 类：非部署对象
+
+- `hmd2`：小程序端 + server，未上线。上线后再按 A 类接。
+- `docs`：文档仓，无部署。
+
+---
+
+## 逐项目特别注意
+
+### card
+- 生产容器名 `card`，镜像 `card:local`，compose 在 `/opt/card/app/compose.yml`
+- 容器内 nginx 监听 80，Caddy 反代 `card:80`
+- ⚠️ 现状「生产容器仍由旧栈构建」（INDEX 记录），接入前先确认 `/opt/card/app` 是当前生产代码
+
+### share-bridge
+- 镜像 `share-bridge:local`，端口 8200，有数据卷 `/opt/share-bridge/data`
+- ⚠️ 源码仓刚建 GitHub 私有仓（`everythingIsZero/share-bridge`），**代码尚未推送**
+
+### zbh
+- 集中栈服务名 `zbh`，容器 `deploy-zbh-1`，镜像自动名 `deploy-zbh:latest`
+- ⚠️ `pnpm-lock.yaml` 里曾出现 `git+ssh://` 形式的 GitHub 依赖导致构建失败（已修）；接入后每次构建都会复现该检查
+- 有 `lint` 脚本，`gate_cmd` 建议 `pnpm lint && pnpm test`
+
+### fang
+- 集中栈服务名 `fang`，容器 `deploy-fang-1`
+- SQLite + 照片资产卷在 `/opt/trae-projects/deploy/data/fang`，**不在 SOURCE_DIR**，rsync 不会碰
+- env 来自 `deploy/.env` 的变量插值（不是 env_file），自检时 `ENV_FILE=/opt/trae-projects/deploy/.env`
+
+### zitie
+- 集中栈服务名是 **`copybook`**（不是 zitie），容器 `deploy-copybook-1`
+- ⚠️ `poetry.db` 2.2G，只读挂载自 `deploy/data/copybook/`，**绝不能进 SOURCE_DIR**（rsync --delete 会删）
+- 源码仓 6.3G 工作目录，同步时靠 `--exclude` 排除大数据文件
+
+### wordinput
+- 集中栈服务名 `wordinput`，容器 `deploy-wordinput-1`
+- ⚠️ 源码仓 1.2G 工作目录，同上
+
+### sso-bridge
+- compose 在 `/opt/sso-bridge/compose.yml`（不在 `app/` 子目录），形态与其他项目不同
+- ⚠️ 同栈含 Casdoor（登录服务），部署会影响全站登录。**必须人工审查 + 单独窗口**，不要接自动部署
+- 若将来接入，`MODE` 需要新增一种适配（compose 在根目录），当前部署器不支持
+
+### schulte-v2
+- 分支是 `feat/v2-production`（不是 main），workflow 两个分支都监听
+- 依赖装在 `apps/client`，`install_cmd` 必须指定 `pnpm -C apps/client install --frozen-lockfile`
+- 旧容器 `schulte`（`schulte:local`）仍在跑，退役前不要动
+- 构建含「缓存安全门」：产物不带内容 hash 会直接构建失败
+
+---
+
+## 接入步骤（照抄）
+
+1. 在 `Projects/ci/projects/<项目>.conf` 新建配置，字段含义：
+
+```sh
+PROJECT=xxx                    # 与 conf 文件名一致
+MODE=self-compose|central-stack
+COMPOSE_FILE=...               # self-compose 才有
+COMPOSE_PROJECT_DIR=...        # self-compose 才有
+STACK_FILE=...                 # central-stack 才有
+SERVICE=...                    # compose 里的服务名
+CONTAINER=...                  # docker ps 里的容器名
+IMAGE_LOCAL=...                # compose 里 image 字段（central-stack 为 deploy-<svc>:latest）
+ENV_FILE=...                   # 服务器 .env 绝对路径；无则留空
+SOURCE_DIR=...                 # 源码同步目标，rsync --delete 的作用范围
+PORT=...                       # 容器内端口（旁路自检用）
+HEALTH_PATH=/healthz 或 /
+DOMAIN=...
+CHECK_COMPRESS=1               # 静态资源站点必开
+COMPRESS_PROBE=auto
+```
+
+2. 项目仓加 `.github/workflows/deploy.yml`（照 nuantie 抄）
+3. 项目仓配 3 个 secrets：`DEPLOY_SSH_KEY` / `DEPLOY_SSH_HOST` / `DEPLOY_SSH_USER`
+4. 本地 `bash scripts/install.sh`
+5. `deploy.sh deploy <项目> --dry-run` 演练
+6. 手动触发一次真实部署，看 `deploy.sh status <项目>`
+
+## 接入顺序建议
+
+先接**静态站/无状态**的（card、share-bridge），再接受**有数据卷**的（fang、zitie），最后才是 sso-bridge。
+每接一个跑一次「空发布」（代码不变，验证流程），确认无异常再接下一个。

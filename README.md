@@ -48,6 +48,8 @@ projects/<项目>.conf          每个项目的部署参数（不进公开仓）
 
 ## 接入一个新项目
 
+**逐项目清单见 [`docs/projects.md`](docs/projects.md)**（形态、SOURCE_DIR、服务名、每个项目的特别注意）。通用步骤：
+
 1. 本仓 `projects/` 加 `<项目>.conf`（照 nuantie.conf 或 home.conf 抄）
 2. 项目仓加 `.github/workflows/deploy.yml`（约 25 行）
 3. 项目仓配 secrets：`DEPLOY_SSH_KEY` / `DEPLOY_SSH_HOST` / `DEPLOY_SSH_USER`
