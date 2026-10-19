@@ -1,0 +1,25 @@
+name: probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 端口连通性
+        run: |
+          HOST=122.51.150.41
+          for p in 22 80 443 2222 8443; do
+            if timeout 6 bash -c "cat < /dev/null > /dev/tcp/$HOST/$p" 2>/dev/null; then
+              echo "端口 $p: 可达"
+            else
+              echo "端口 $p: 不可达"
+            fi
+          done
+      - name: HTTPS 可达性
+        run: |
+          for u in https://www.hxym18.com/ https://nt.hxym18.com/healthz; do
+            code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$u" || echo 000)
+            echo "$u → $code"
+          done
