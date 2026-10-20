@@ -16,8 +16,9 @@
 
 ```
 .github/workflows/ci.yml       可复用：安装 → 门禁 → 可选构建镜像（只验 Dockerfile 能构建）
-.github/workflows/deploy.yml   已停用：被调用即报错并说明原因，不做任何事
 ```
+
+**没有 `deploy.yml`。** 2026-10-20：9 个项目仓的 `deploy` job 全部删除后，那个「被调用即报错」的路牌也一并移除了。任何项目都不应再有 `uses: everythingIsZero/ci/.github/workflows/deploy.yml`。
 
 ## 接入一个项目（只要门禁）
 
