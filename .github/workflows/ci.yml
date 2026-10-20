@@ -33,20 +33,13 @@ on:
       build_args:
         default: ""
         type: string
-      push_image:
-        default: false
-        type: boolean
+      # 只验 Dockerfile 能构建 + 镜像可执行，不推任何 registry。
+      # 原 push_image / REGISTRY_* 是旧私有 registry 路线的遗留，registry 已随部署器退役移除。
       verify_dockerfile:
         default: false
         type: boolean
     secrets:
       NPM_TOKEN:
-        required: false
-      REGISTRY_HOST:
-        required: false
-      REGISTRY_USER:
-        required: false
-      REGISTRY_PASS:
         required: false
     outputs:
       image:
@@ -79,7 +72,6 @@ jobs:
         run: |
           echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
           echo "image=${{ inputs.project }}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
-          echo "remote=${{ secrets.REGISTRY_HOST }}/${{ inputs.project }}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
       - uses: pnpm/action-setup@v4
         if: inputs.package_manager == 'pnpm'
@@ -108,7 +100,7 @@ jobs:
         run: eval "${{ inputs.gate_cmd }}"
 
       - name: 构建镜像
-        if: inputs.push_image || inputs.verify_dockerfile
+        if: inputs.verify_dockerfile
         run: |
           args=()
           while IFS= read -r line; do
@@ -121,20 +113,8 @@ jobs:
             --format '镜像大小 {{.Size}} bytes · 入口 {{.Config.Cmd}}'
 
       - name: 镜像结构冒烟
-        if: inputs.push_image || inputs.verify_dockerfile
+        if: inputs.verify_dockerfile
         run: |
           img="${{ steps.meta.outputs.image }}"
           docker run --rm --entrypoint sh "$img" -c 'echo 镜像可执行' \
             || echo "::warning::镜像无 sh（distroless/scratch），跳过结构冒烟"
-
-      - name: 登录私有 registry
-        if: inputs.push_image
-        run: |
-          echo "${{ secrets.REGISTRY_PASS }}" | docker login "${{ secrets.REGISTRY_HOST }}" \
-            -u "${{ secrets.REGISTRY_USER }}" --password-stdin
-
-      - name: 推送镜像（只传缺失层）
-        if: inputs.push_image
-        run: |
-          docker tag "${{ steps.meta.outputs.image }}" "${{ steps.meta.outputs.remote }}"
-          docker push "${{ steps.meta.outputs.remote }}"
